@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [1.0.2] - 2026-04-11
+## [1.0.22] - 2026-04-11
 
 ### Added
 

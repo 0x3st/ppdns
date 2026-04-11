@@ -32,7 +32,7 @@ curl -fsSL https://raw.githubusercontent.com/0x3st/ppdns/main/scripts/install.sh
 Install a specific version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/0x3st/ppdns/main/scripts/install.sh | sh -s -- --version 1.0.2
+curl -fsSL https://raw.githubusercontent.com/0x3st/ppdns/main/scripts/install.sh | sh -s -- --version 1.0.22
 ```
 
 Install to a custom directory:
