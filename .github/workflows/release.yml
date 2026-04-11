@@ -41,9 +41,7 @@ jobs:
         run: bash scripts/check-changelog.sh "${GITHUB_REF_NAME#v}"
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+        run: bash scripts/install-rust-toolchain.sh stable ${{ matrix.target }}
 
       - name: Install Zig
         uses: mlugg/setup-zig@v1
