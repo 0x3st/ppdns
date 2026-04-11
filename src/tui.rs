@@ -121,6 +121,7 @@ struct DeleteDialog {
 
 struct PendingZoneReload {
     ready_at: Instant,
+    clear_records: bool,
 }
 
 struct FlashMessage {
@@ -209,12 +210,24 @@ impl DnsPanel {
     fn schedule_record_reload(&mut self) {
         self.pending_zone_reload = self.selected_zone().map(|_| PendingZoneReload {
             ready_at: Instant::now() + Duration::from_millis(120),
+            clear_records: true,
         });
 
-        self.records_loading = self.pending_zone_reload.is_some();
-        self.records.clear();
-        self.rebuild_filtered_records();
-        self.record_state.select(None);
+        if let Some(pending) = &self.pending_zone_reload {
+            self.records_loading = pending.clear_records;
+            if pending.clear_records {
+                self.records.clear();
+                self.rebuild_filtered_records();
+                self.record_state.select(None);
+            }
+        }
+    }
+
+    fn schedule_background_reload(&mut self, delay: Duration) {
+        self.pending_zone_reload = self.selected_zone().map(|_| PendingZoneReload {
+            ready_at: Instant::now() + delay,
+            clear_records: false,
+        });
     }
 
     fn flush_pending_zone_reload(&mut self) {
@@ -965,7 +978,10 @@ impl DnsPanel {
 
         let add_output = self.run_mutation(&runner.add_record_args(&spec))?;
         let serial_warning = self.bump_serial(&zone, runner);
-        self.reload_records();
+        if !self.global.dry_run {
+            self.apply_add_locally(&spec);
+            self.schedule_background_reload(Duration::from_millis(800));
+        }
 
         let mut message = if self.global.dry_run {
             "dry run: add command prepared".to_string()
@@ -1000,7 +1016,10 @@ impl DnsPanel {
         let plan = build_delete_plan(&spec.zone, &self.records, spec)?;
         let delete_output = self.run_mutation(&runner.delete_plan_args(&plan))?;
         let serial_warning = self.bump_serial(&spec.zone, runner);
-        self.reload_records();
+        if !self.global.dry_run {
+            self.apply_delete_locally(spec, &plan);
+            self.schedule_background_reload(Duration::from_millis(800));
+        }
 
         let mut message = if self.global.dry_run {
             "dry run: delete command prepared".to_string()
@@ -1053,6 +1072,46 @@ impl DnsPanel {
             Ok(_) => None,
             Err(err) => Some(format!("failed to increase SOA serial: {err}")),
         }
+    }
+
+    fn apply_add_locally(&mut self, spec: &AddRecordSpec) {
+        self.records.push(ZoneRecord {
+            name: spec.name.clone(),
+            ttl: spec.ttl,
+            record_type: spec.record_type.clone(),
+            content: spec.content.clone(),
+        });
+        self.rebuild_filtered_records();
+        self.ensure_record_selection();
+    }
+
+    fn apply_delete_locally(&mut self, spec: &DeleteRecordSpec, plan: &DeletePlan) {
+        match &plan.method {
+            DeleteMethod::DeleteRrset => {
+                self.records.retain(|record| {
+                    !(record.name == spec.name
+                        && record.record_type.eq_ignore_ascii_case(&spec.record_type))
+                });
+            }
+            DeleteMethod::Replace { .. } => {
+                let mut removed = false;
+                self.records.retain(|record| {
+                    let matches = !removed
+                        && record.name == spec.name
+                        && record.record_type.eq_ignore_ascii_case(&spec.record_type)
+                        && record.content == spec.content;
+                    if matches {
+                        removed = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+
+        self.rebuild_filtered_records();
+        self.ensure_record_selection();
     }
 
     fn panel_block(&self, title: &str, focused: bool) -> Block<'static> {

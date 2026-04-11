@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0-alpha.3] - 2026-04-12
+
+### Fixed
+
+- Updated add and delete flows to apply successful changes to the in-memory record list immediately, so the TUI no longer leaves stale rows on screen after a mutation.
+- Delayed the follow-up zone refresh after mutations so the panel can stay responsive while PowerDNS catches up.
+
 ## [1.1.0-alpha.2] - 2026-04-11
 
 ### Changed
