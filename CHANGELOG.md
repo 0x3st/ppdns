@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0-alpha.4] - 2026-04-12
+
+### Fixed
+
+- Moved zone-record loading and add/delete mutations off the TUI thread so navigation no longer blocks on `pdnsutil`.
+- Accepted terminal key repeat events in addition to key press events so arrow-key navigation works reliably in terminals such as Termius.
+- Kept mutation results flowing back into the current view through a background event channel so successful changes update the panel without freezing input.
+
 ## [1.1.0-alpha.3] - 2026-04-12
 
 ### Fixed

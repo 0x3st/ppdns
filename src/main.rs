@@ -174,6 +174,7 @@ enum PdnsSyntax {
     Legacy,
 }
 
+#[derive(Clone)]
 struct PdnsUtil {
     global: GlobalOptions,
     syntax: PdnsSyntax,

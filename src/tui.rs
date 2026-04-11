@@ -1,4 +1,6 @@
 use std::io::{self, Stdout};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -17,15 +19,15 @@ use ratatui::Terminal;
 
 use super::*;
 
-const BRAND: Color = Color::Rgb(242, 140, 40);
-const BRAND_DIM: Color = Color::Rgb(191, 112, 36);
-const PANEL_BG: Color = Color::Rgb(18, 24, 33);
-const PANEL_ALT_BG: Color = Color::Rgb(14, 18, 26);
-const BORDER: Color = Color::Rgb(62, 78, 96);
-const MUTED: Color = Color::Rgb(148, 163, 184);
-const SUCCESS: Color = Color::Rgb(74, 222, 128);
-const WARNING: Color = Color::Rgb(251, 191, 36);
-const ERROR: Color = Color::Rgb(248, 113, 113);
+const BRAND: Color = Color::Rgb(230, 230, 230);
+const BRAND_DIM: Color = Color::Rgb(180, 180, 180);
+const PANEL_BG: Color = Color::Rgb(10, 10, 10);
+const PANEL_ALT_BG: Color = Color::Rgb(14, 14, 14);
+const BORDER: Color = Color::Rgb(70, 70, 70);
+const MUTED: Color = Color::Rgb(150, 150, 150);
+const SUCCESS: Color = Color::Rgb(220, 220, 220);
+const WARNING: Color = Color::Rgb(200, 200, 200);
+const ERROR: Color = Color::Rgb(235, 235, 235);
 
 pub fn run(global: &GlobalOptions) -> AppResult<()> {
     let mut session = TerminalSession::enter()?;
@@ -68,6 +70,11 @@ struct DnsPanel {
     global: GlobalOptions,
     runner: Option<PdnsUtil>,
     backend_error: Option<String>,
+    background_tx: Sender<BackgroundEvent>,
+    background_rx: Receiver<BackgroundEvent>,
+    next_request_id: u64,
+    active_records_request: Option<u64>,
+    active_mutation_request: Option<u64>,
     zones: Vec<String>,
     zone_state: ListState,
     records: Vec<ZoneRecord>,
@@ -129,6 +136,33 @@ struct FlashMessage {
     text: String,
 }
 
+enum BackgroundEvent {
+    RecordsLoaded {
+        request_id: u64,
+        zone: String,
+        result: AppResult<Vec<ZoneRecord>>,
+    },
+    MutationFinished {
+        request_id: u64,
+        zone: String,
+        result: AppResult<MutationResult>,
+    },
+}
+
+enum MutationResult {
+    Add {
+        spec: AddRecordSpec,
+        output: Option<String>,
+        serial_warning: Option<String>,
+    },
+    Delete {
+        spec: DeleteRecordSpec,
+        plan: DeletePlan,
+        output: Option<String>,
+        serial_warning: Option<String>,
+    },
+}
+
 #[derive(Clone, Copy)]
 enum FlashKind {
     Info,
@@ -139,6 +173,7 @@ enum FlashKind {
 
 impl DnsPanel {
     fn new(global: GlobalOptions) -> Self {
+        let (background_tx, background_rx) = mpsc::channel();
         let mut zone_state = ListState::default();
         zone_state.select(Some(0));
 
@@ -149,6 +184,11 @@ impl DnsPanel {
             global,
             runner: None,
             backend_error: None,
+            background_tx,
+            background_rx,
+            next_request_id: 1,
+            active_records_request: None,
+            active_mutation_request: None,
             zones: Vec::new(),
             zone_state,
             records: Vec::new(),
@@ -167,23 +207,35 @@ impl DnsPanel {
         let mut needs_draw = true;
 
         loop {
+            if self.drain_background_events() {
+                needs_draw = true;
+            }
+
             if needs_draw {
                 terminal.draw(|frame| self.draw(frame))?;
                 needs_draw = false;
             }
 
-            if let Some(timeout) = self.pending_zone_reload_timeout() {
-                if !event::poll(timeout)? {
+            let timeout = self
+                .pending_zone_reload_timeout()
+                .map(|timeout| timeout.min(Duration::from_millis(50)))
+                .unwrap_or_else(|| Duration::from_millis(50));
+
+            if !event::poll(timeout)? {
+                if self
+                    .pending_zone_reload_timeout()
+                    .is_some_and(|timeout| timeout.is_zero())
+                {
                     self.flush_pending_zone_reload();
                     needs_draw = true;
-                    continue;
                 }
+                continue;
             }
 
             let next_event = event::read()?;
 
             match next_event {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if self.handle_key(key)? {
                         return Ok(());
                     }
@@ -199,6 +251,27 @@ impl DnsPanel {
                 _ => {}
             }
         }
+    }
+
+    fn drain_background_events(&mut self) -> bool {
+        let mut changed = false;
+
+        loop {
+            match self.background_rx.try_recv() {
+                Ok(event) => {
+                    self.handle_background_event(event);
+                    changed = true;
+                }
+                Err(TryRecvError::Empty) => return changed,
+                Err(TryRecvError::Disconnected) => return changed,
+            }
+        }
+    }
+
+    fn next_request_id(&mut self) -> u64 {
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+        request_id
     }
 
     fn pending_zone_reload_timeout(&self) -> Option<Duration> {
@@ -231,8 +304,119 @@ impl DnsPanel {
     }
 
     fn flush_pending_zone_reload(&mut self) {
-        if self.pending_zone_reload.take().is_some() {
-            self.reload_records();
+        if let Some(pending) = self.pending_zone_reload.take() {
+            self.reload_records(pending.clear_records);
+        }
+    }
+
+    fn handle_background_event(&mut self, event: BackgroundEvent) {
+        match event {
+            BackgroundEvent::RecordsLoaded {
+                request_id,
+                zone,
+                result,
+            } => {
+                if self.active_records_request != Some(request_id) {
+                    return;
+                }
+
+                self.active_records_request = None;
+                self.records_loading = false;
+
+                if self.selected_zone() != Some(zone.as_str()) {
+                    return;
+                }
+
+                match result {
+                    Ok(records) => {
+                        self.records = records;
+                        self.rebuild_filtered_records();
+                        self.ensure_record_selection();
+                    }
+                    Err(err) => {
+                        self.records.clear();
+                        self.rebuild_filtered_records();
+                        self.record_state.select(None);
+                        self.message = Some(FlashMessage::error(err.to_string()));
+                    }
+                }
+            }
+            BackgroundEvent::MutationFinished {
+                request_id,
+                zone,
+                result,
+            } => {
+                if self.active_mutation_request != Some(request_id) {
+                    return;
+                }
+
+                self.active_mutation_request = None;
+
+                match result {
+                    Ok(MutationResult::Add {
+                        spec,
+                        output,
+                        serial_warning,
+                    }) => {
+                        if self.selected_zone() == Some(zone.as_str()) {
+                            self.apply_add_locally(&spec);
+                            self.schedule_background_reload(Duration::from_millis(800));
+                        }
+
+                        self.message = Some(self.build_mutation_message(
+                            format!(
+                                "record added: {} {} {}",
+                                spec.name, spec.record_type, spec.content
+                            ),
+                            output,
+                            serial_warning,
+                        ));
+                    }
+                    Ok(MutationResult::Delete {
+                        spec,
+                        plan,
+                        output,
+                        serial_warning,
+                    }) => {
+                        if self.selected_zone() == Some(zone.as_str()) {
+                            self.apply_delete_locally(&spec, &plan);
+                            self.schedule_background_reload(Duration::from_millis(800));
+                        }
+
+                        self.message = Some(self.build_mutation_message(
+                            format!(
+                                "record deleted: {} {} {}",
+                                spec.name, spec.record_type, spec.content
+                            ),
+                            output,
+                            serial_warning,
+                        ));
+                    }
+                    Err(err) => {
+                        self.message = Some(FlashMessage::error(err.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    fn build_mutation_message(
+        &self,
+        mut message: String,
+        output: Option<String>,
+        serial_warning: Option<String>,
+    ) -> FlashMessage {
+        if let Some(output) = output {
+            if !output.is_empty() {
+                message.push_str(" | ");
+                message.push_str(&output);
+            }
+        }
+
+        if let Some(warning) = serial_warning {
+            FlashMessage::warning(format!("{message} | {warning}"))
+        } else {
+            FlashMessage::success(message)
         }
     }
 
@@ -400,7 +584,7 @@ impl DnsPanel {
             .block(self.panel_block(&title, self.focus == Focus::Records))
             .row_highlight_style(
                 Style::default()
-                    .bg(Color::Rgb(43, 52, 69))
+                    .bg(Color::Rgb(55, 55, 55))
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             )
@@ -754,6 +938,8 @@ impl DnsPanel {
     fn refresh_all(&mut self) {
         self.pending_zone_reload = None;
         self.records_loading = false;
+        self.active_records_request = None;
+        self.active_mutation_request = None;
         self.runner = match PdnsUtil::new(self.global.clone()) {
             Ok(runner) => {
                 self.backend_error = None;
@@ -794,7 +980,7 @@ impl DnsPanel {
 
                 self.zone_state.select(selected);
                 self.pending_zone_reload = None;
-                self.reload_records();
+                self.reload_records(true);
             }
             Err(err) => {
                 self.zones.clear();
@@ -807,39 +993,45 @@ impl DnsPanel {
         }
     }
 
-    fn reload_records(&mut self) {
+    fn reload_records(&mut self, clear_records: bool) {
         self.pending_zone_reload = None;
         let Some(zone) = self.selected_zone().map(ToOwned::to_owned) else {
             self.records.clear();
             self.rebuild_filtered_records();
             self.records_loading = false;
+            self.active_records_request = None;
             self.record_state.select(None);
             return;
         };
 
-        let Some(runner) = self.runner.as_ref() else {
+        let Some(runner) = self.runner.as_ref().cloned() else {
             self.records.clear();
             self.rebuild_filtered_records();
             self.records_loading = false;
+            self.active_records_request = None;
             self.record_state.select(None);
             return;
         };
 
-        match runner.list_zone_records(&zone) {
-            Ok(records) => {
-                self.records = records;
-                self.records_loading = false;
-                self.rebuild_filtered_records();
-                self.ensure_record_selection();
-            }
-            Err(err) => {
-                self.records.clear();
-                self.rebuild_filtered_records();
-                self.records_loading = false;
-                self.record_state.select(None);
-                self.message = Some(FlashMessage::error(err.to_string()));
-            }
+        let request_id = self.next_request_id();
+        self.active_records_request = Some(request_id);
+        self.records_loading = true;
+
+        if clear_records {
+            self.records.clear();
+            self.rebuild_filtered_records();
+            self.record_state.select(None);
         }
+
+        let background_tx = self.background_tx.clone();
+        thread::spawn(move || {
+            let result = runner.list_zone_records(&zone);
+            let _ = background_tx.send(BackgroundEvent::RecordsLoaded {
+                request_id,
+                zone,
+                result,
+            });
+        });
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -942,6 +1134,13 @@ impl DnsPanel {
     }
 
     fn submit_add_form(&mut self, form: &AddForm) -> AppResult<()> {
+        if self.active_mutation_request.is_some() {
+            self.message = Some(FlashMessage::warning(
+                "wait for the current change to finish",
+            ));
+            return Ok(());
+        }
+
         let zone = self
             .selected_zone()
             .ok_or_else(|| AppError::Message("no zone selected".to_string()))?
@@ -949,6 +1148,7 @@ impl DnsPanel {
         let runner = self
             .runner
             .as_ref()
+            .cloned()
             .ok_or_else(|| AppError::Message("pdnsutil is unavailable".to_string()))?;
 
         let record_type = normalize_record_type(&form.record_type);
@@ -976,102 +1176,96 @@ impl DnsPanel {
             ttl,
         };
 
-        let add_output = self.run_mutation(&runner.add_record_args(&spec))?;
-        let serial_warning = self.bump_serial(&zone, runner);
-        if !self.global.dry_run {
-            self.apply_add_locally(&spec);
-            self.schedule_background_reload(Duration::from_millis(800));
+        if self.global.dry_run {
+            let add_output = run_mutation_with_runner(&runner, &runner.add_record_args(&spec))?;
+            let serial_warning = bump_serial_with_runner(&zone, &runner);
+            self.message = Some(self.build_mutation_message(
+                "dry run: add command prepared".to_string(),
+                add_output,
+                serial_warning,
+            ));
+            return Ok(());
         }
 
-        let mut message = if self.global.dry_run {
-            "dry run: add command prepared".to_string()
-        } else {
-            format!(
-                "record added: {} {} {}",
-                spec.name, spec.record_type, spec.content
-            )
-        };
+        let request_id = self.next_request_id();
+        self.active_mutation_request = Some(request_id);
+        self.message = Some(FlashMessage::info("adding record..."));
 
-        if let Some(output) = add_output {
-            if !output.is_empty() {
-                message.push_str(" | ");
-                message.push_str(&output);
-            }
-        }
+        let background_tx = self.background_tx.clone();
+        thread::spawn(move || {
+            let result = (|| {
+                let output = run_mutation_with_runner(&runner, &runner.add_record_args(&spec))?;
+                let serial_warning = bump_serial_with_runner(&zone, &runner);
+                Ok(MutationResult::Add {
+                    spec,
+                    output,
+                    serial_warning,
+                })
+            })();
 
-        if let Some(warning) = serial_warning {
-            self.message = Some(FlashMessage::warning(format!("{message} | {warning}")));
-        } else {
-            self.message = Some(FlashMessage::success(message));
-        }
+            let _ = background_tx.send(BackgroundEvent::MutationFinished {
+                request_id,
+                zone,
+                result,
+            });
+        });
 
         Ok(())
     }
 
     fn delete_record(&mut self, spec: &DeleteRecordSpec) -> AppResult<()> {
+        if self.active_mutation_request.is_some() {
+            self.message = Some(FlashMessage::warning(
+                "wait for the current change to finish",
+            ));
+            return Ok(());
+        }
+
         let runner = self
             .runner
             .as_ref()
+            .cloned()
             .ok_or_else(|| AppError::Message("pdnsutil is unavailable".to_string()))?;
         let plan = build_delete_plan(&spec.zone, &self.records, spec)?;
-        let delete_output = self.run_mutation(&runner.delete_plan_args(&plan))?;
-        let serial_warning = self.bump_serial(&spec.zone, runner);
-        if !self.global.dry_run {
-            self.apply_delete_locally(spec, &plan);
-            self.schedule_background_reload(Duration::from_millis(800));
+        let zone = spec.zone.clone();
+
+        if self.global.dry_run {
+            let delete_output = run_mutation_with_runner(&runner, &runner.delete_plan_args(&plan))?;
+            let serial_warning = bump_serial_with_runner(&zone, &runner);
+            self.message = Some(self.build_mutation_message(
+                "dry run: delete command prepared".to_string(),
+                delete_output,
+                serial_warning,
+            ));
+            return Ok(());
         }
 
-        let mut message = if self.global.dry_run {
-            "dry run: delete command prepared".to_string()
-        } else {
-            format!(
-                "record deleted: {} {} {}",
-                spec.name, spec.record_type, spec.content
-            )
-        };
+        let request_id = self.next_request_id();
+        self.active_mutation_request = Some(request_id);
+        self.message = Some(FlashMessage::info("deleting record..."));
 
-        if let Some(output) = delete_output {
-            if !output.is_empty() {
-                message.push_str(" | ");
-                message.push_str(&output);
-            }
-        }
+        let spec = spec.clone();
+        let background_tx = self.background_tx.clone();
+        thread::spawn(move || {
+            let result = (|| {
+                let output = run_mutation_with_runner(&runner, &runner.delete_plan_args(&plan))?;
+                let serial_warning = bump_serial_with_runner(&zone, &runner);
+                Ok(MutationResult::Delete {
+                    spec,
+                    plan,
+                    output,
+                    serial_warning,
+                })
+            })();
 
-        if let Some(warning) = serial_warning {
-            self.message = Some(FlashMessage::warning(format!("{message} | {warning}")));
-        } else {
-            self.message = Some(FlashMessage::success(message));
-        }
+            let _ = background_tx.send(BackgroundEvent::MutationFinished {
+                request_id,
+                zone,
+                result,
+            });
+        });
 
         Ok(())
-    }
-
-    fn run_mutation(&self, args: &[String]) -> AppResult<Option<String>> {
-        let runner = self
-            .runner
-            .as_ref()
-            .ok_or_else(|| AppError::Message("pdnsutil is unavailable".to_string()))?;
-
-        if runner.global.dry_run {
-            return Ok(Some(format!("DRY RUN {}", runner.preview_command(args))));
-        }
-
-        let output = runner.run_capture(args)?;
-        let trimmed = output.trim();
-        if trimmed.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(trimmed.to_string()))
-        }
-    }
-
-    fn bump_serial(&self, zone: &str, runner: &PdnsUtil) -> Option<String> {
-        let args = runner.increase_serial_args(zone);
-        match self.run_mutation(&args) {
-            Ok(_) if runner.global.dry_run => Some("SOA serial bump planned".to_string()),
-            Ok(_) => None,
-            Err(err) => Some(format!("failed to increase SOA serial: {err}")),
-        }
     }
 
     fn apply_add_locally(&mut self, spec: &AddRecordSpec) {
@@ -1130,6 +1324,29 @@ impl DnsPanel {
             .border_type(BorderType::Plain)
             .border_style(Style::default().fg(BRAND_DIM))
             .style(Style::default().bg(PANEL_ALT_BG))
+    }
+}
+
+fn run_mutation_with_runner(runner: &PdnsUtil, args: &[String]) -> AppResult<Option<String>> {
+    if runner.global.dry_run {
+        return Ok(Some(format!("DRY RUN {}", runner.preview_command(args))));
+    }
+
+    let output = runner.run_capture(args)?;
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
+    }
+}
+
+fn bump_serial_with_runner(zone: &str, runner: &PdnsUtil) -> Option<String> {
+    let args = runner.increase_serial_args(zone);
+    match run_mutation_with_runner(runner, &args) {
+        Ok(_) if runner.global.dry_run => Some("SOA serial bump planned".to_string()),
+        Ok(_) => None,
+        Err(err) => Some(format!("failed to increase SOA serial: {err}")),
     }
 }
 
