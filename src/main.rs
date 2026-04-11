@@ -1,6 +1,8 @@
 use std::env;
 use std::fmt;
+use std::fs;
 use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 type AppResult<T> = Result<T, AppError>;
@@ -168,6 +170,62 @@ struct PdnsUtil {
     syntax: PdnsSyntax,
 }
 
+const PPDNS_RELEASE_REPO: &str = "0x3st/ppdns";
+
+#[derive(Debug, Clone, Copy)]
+enum HomeAction {
+    AddRecord,
+    DeleteRecord,
+    ListZones,
+    ListRecords,
+    InstallPowerDns,
+    UpdatePowerDns,
+    ReinstallPowerDns,
+    UpdatePpdns,
+    ReinstallPpdns,
+    Exit,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PackageAction {
+    Install,
+    Update,
+    Reinstall,
+}
+
+#[derive(Debug, Clone)]
+enum PowerDnsStatus {
+    NotInstalled {
+        candidate: Option<String>,
+    },
+    Installed {
+        installed: String,
+        candidate: Option<String>,
+    },
+    Unsupported {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum SelfStatus {
+    LatestKnown {
+        current: String,
+        latest: String,
+        update_available: bool,
+    },
+    UnknownLatest {
+        current: String,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct HomeStatus {
+    powerdns: PowerDnsStatus,
+    ppdns: SelfStatus,
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("Error: {err}");
@@ -262,8 +320,7 @@ impl Cli {
                     print_help();
                     return Ok(());
                 }
-                let runner = PdnsUtil::new(self.global)?;
-                interactive_home(&runner)
+                interactive_home(&self.global)
             }
             Some(CommandKind::AddRecord(args)) => {
                 let runner = PdnsUtil::new(self.global)?;
@@ -786,28 +843,156 @@ fn execute_list_records(runner: &PdnsUtil, args: ListRecordsArgs) -> AppResult<(
     print_records(&zone, &records)
 }
 
-fn interactive_home(runner: &PdnsUtil) -> AppResult<()> {
+fn interactive_home(global: &GlobalOptions) -> AppResult<()> {
     loop {
-        let choice = prompt_select(
-            "Choose an action",
-            &[
-                "Add record".to_string(),
-                "Delete record".to_string(),
-                "List zones".to_string(),
-                "List records".to_string(),
-                "Exit".to_string(),
-            ],
-        )?;
+        let status = gather_home_status();
+        print_home_status(&status);
 
-        match choice {
-            0 => execute_add_record(runner, AddRecordArgs::default())?,
-            1 => execute_delete_record(runner, DeleteRecordArgs::default())?,
-            2 => print_zones(&runner.list_zones()?)?,
-            3 => execute_list_records(runner, ListRecordsArgs::default())?,
-            4 => return Ok(()),
-            _ => unreachable!(),
+        let actions = build_home_actions(&status);
+        let labels: Vec<String> = actions.iter().map(|(label, _)| label.clone()).collect();
+        let choice = prompt_select("Choose an action", &labels)?;
+
+        match actions[choice].1 {
+            HomeAction::AddRecord => {
+                let runner = PdnsUtil::new(global.clone())?;
+                execute_add_record(&runner, AddRecordArgs::default())?;
+            }
+            HomeAction::DeleteRecord => {
+                let runner = PdnsUtil::new(global.clone())?;
+                execute_delete_record(&runner, DeleteRecordArgs::default())?;
+            }
+            HomeAction::ListZones => {
+                let runner = PdnsUtil::new(global.clone())?;
+                print_zones(&runner.list_zones()?)?;
+            }
+            HomeAction::ListRecords => {
+                let runner = PdnsUtil::new(global.clone())?;
+                execute_list_records(&runner, ListRecordsArgs::default())?;
+            }
+            HomeAction::InstallPowerDns => {
+                execute_powerdns_package_action(global, PackageAction::Install)?;
+            }
+            HomeAction::UpdatePowerDns => {
+                execute_powerdns_package_action(global, PackageAction::Update)?;
+            }
+            HomeAction::ReinstallPowerDns => {
+                execute_powerdns_package_action(global, PackageAction::Reinstall)?;
+            }
+            HomeAction::UpdatePpdns => {
+                execute_self_update_action(global, false, Some(&status.ppdns))?;
+            }
+            HomeAction::ReinstallPpdns => {
+                execute_self_update_action(global, true, Some(&status.ppdns))?;
+            }
+            HomeAction::Exit => return Ok(()),
         }
     }
+}
+
+fn gather_home_status() -> HomeStatus {
+    HomeStatus {
+        powerdns: detect_powerdns_status(),
+        ppdns: detect_self_status(),
+    }
+}
+
+fn print_home_status(status: &HomeStatus) {
+    println!("Status:");
+
+    match &status.powerdns {
+        PowerDnsStatus::NotInstalled { candidate } => {
+            if let Some(candidate) = candidate {
+                println!("  PowerDNS: not installed, candidate in current repos: {candidate}");
+            } else {
+                println!("  PowerDNS: not installed");
+            }
+        }
+        PowerDnsStatus::Installed {
+            installed,
+            candidate,
+        } => {
+            if let Some(candidate) = candidate {
+                if candidate != installed {
+                    println!(
+                        "  PowerDNS: installed {installed}, candidate {candidate} in current repos"
+                    );
+                } else {
+                    println!("  PowerDNS: installed {installed}, up to date in current repos");
+                }
+            } else {
+                println!("  PowerDNS: installed {installed}");
+            }
+        }
+        PowerDnsStatus::Unsupported { reason } => {
+            println!("  PowerDNS: status check unavailable ({reason})");
+        }
+    }
+
+    match &status.ppdns {
+        SelfStatus::LatestKnown {
+            current,
+            latest,
+            update_available,
+        } => {
+            if *update_available {
+                println!("  ppdns: current {current}, latest {latest}");
+            } else {
+                println!("  ppdns: current {current}, up to date");
+            }
+        }
+        SelfStatus::UnknownLatest { current, reason } => {
+            println!("  ppdns: current {current}, latest check unavailable ({reason})");
+        }
+    }
+
+    println!();
+}
+
+fn build_home_actions(status: &HomeStatus) -> Vec<(String, HomeAction)> {
+    let mut actions = vec![
+        ("Add record".to_string(), HomeAction::AddRecord),
+        ("Delete record".to_string(), HomeAction::DeleteRecord),
+        ("List zones".to_string(), HomeAction::ListZones),
+        ("List records".to_string(), HomeAction::ListRecords),
+    ];
+
+    match &status.powerdns {
+        PowerDnsStatus::NotInstalled { .. } => {
+            actions.push(("Install PowerDNS".to_string(), HomeAction::InstallPowerDns));
+        }
+        PowerDnsStatus::Installed {
+            installed,
+            candidate,
+        } => {
+            if candidate
+                .as_ref()
+                .is_some_and(|candidate| candidate != installed)
+            {
+                actions.push(("Update PowerDNS".to_string(), HomeAction::UpdatePowerDns));
+            }
+            actions.push((
+                "Reinstall PowerDNS".to_string(),
+                HomeAction::ReinstallPowerDns,
+            ));
+        }
+        PowerDnsStatus::Unsupported { .. } => {}
+    }
+
+    match &status.ppdns {
+        SelfStatus::LatestKnown {
+            update_available: true,
+            ..
+        } => {
+            actions.push(("Update ppdns".to_string(), HomeAction::UpdatePpdns));
+            actions.push(("Reinstall ppdns".to_string(), HomeAction::ReinstallPpdns));
+        }
+        SelfStatus::LatestKnown { .. } | SelfStatus::UnknownLatest { .. } => {
+            actions.push(("Reinstall ppdns".to_string(), HomeAction::ReinstallPpdns));
+        }
+    }
+
+    actions.push(("Exit".to_string(), HomeAction::Exit));
+    actions
 }
 
 fn resolve_add_record_spec(runner: &PdnsUtil, args: AddRecordArgs) -> AppResult<AddRecordSpec> {
@@ -1314,6 +1499,527 @@ fn print_records(zone: &str, records: &[ZoneRecord]) -> AppResult<()> {
     Ok(())
 }
 
+fn detect_powerdns_status() -> PowerDnsStatus {
+    if !command_exists("apt-cache") {
+        return PowerDnsStatus::Unsupported {
+            reason: "apt-based package manager not found".to_string(),
+        };
+    }
+
+    let installed = detect_powerdns_installed_version().ok().flatten();
+    let candidate = detect_apt_candidate_version("pdns-server").ok().flatten();
+
+    match installed {
+        Some(installed) => PowerDnsStatus::Installed {
+            installed,
+            candidate,
+        },
+        None => PowerDnsStatus::NotInstalled { candidate },
+    }
+}
+
+fn detect_self_status() -> SelfStatus {
+    let current = env!("CARGO_PKG_VERSION").to_string();
+
+    match fetch_latest_ppdns_version() {
+        Ok(latest) => {
+            let update_available = compare_numeric_versions(&latest, &current).is_gt();
+            SelfStatus::LatestKnown {
+                current,
+                latest,
+                update_available,
+            }
+        }
+        Err(err) => SelfStatus::UnknownLatest {
+            current,
+            reason: err.to_string(),
+        },
+    }
+}
+
+fn execute_powerdns_package_action(global: &GlobalOptions, action: PackageAction) -> AppResult<()> {
+    if !command_exists("apt-get") || !command_exists("apt-cache") || !command_exists("install") {
+        return Err(AppError::Message(
+            "PowerDNS package management currently supports apt-based Linux only".to_string(),
+        ));
+    }
+
+    let mut packages = detect_installed_powerdns_packages()?;
+
+    if matches!(action, PackageAction::Install) || !packages.iter().any(|pkg| pkg == "pdns-server")
+    {
+        packages.push("pdns-server".to_string());
+    }
+
+    if !packages.iter().any(|pkg| pkg.starts_with("pdns-backend-")) {
+        packages.push(prompt_powerdns_backend_package()?);
+    }
+
+    packages.sort();
+    packages.dedup();
+
+    let action_label = match action {
+        PackageAction::Install => "install",
+        PackageAction::Update => "update",
+        PackageAction::Reinstall => "reinstall",
+    };
+
+    println!("Ready to {action_label} PowerDNS packages from current apt repositories:");
+    for package in &packages {
+        println!("  {package}");
+    }
+
+    if !prompt_confirm("Continue?", true)? {
+        println!("Cancelled.");
+        return Ok(());
+    }
+
+    run_system_status(global, "apt-get", &["update".to_string()], true)?;
+
+    let mut args = vec!["install".to_string(), "-y".to_string()];
+    match action {
+        PackageAction::Install => {}
+        PackageAction::Update => args.push("--only-upgrade".to_string()),
+        PackageAction::Reinstall => args.push("--reinstall".to_string()),
+    }
+    args.extend(packages.iter().cloned());
+
+    run_system_status(global, "apt-get", &args, true)?;
+    println!("PowerDNS package action completed.");
+    Ok(())
+}
+
+fn execute_self_update_action(
+    global: &GlobalOptions,
+    reinstall: bool,
+    status: Option<&SelfStatus>,
+) -> AppResult<()> {
+    ensure_command_available("tar")?;
+
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    let desired_version = if reinstall {
+        current.clone()
+    } else {
+        match status {
+            Some(SelfStatus::LatestKnown { latest, .. }) => latest.clone(),
+            _ => fetch_latest_ppdns_version()?,
+        }
+    };
+
+    let target = current_ppdns_target()?;
+    let archive_name = format!("ppdns-{target}.tar.gz");
+    let url = format!(
+        "https://github.com/{}/releases/download/v{}/{}",
+        PPDNS_RELEASE_REPO, desired_version, archive_name
+    );
+    let current_exe = env::current_exe()?;
+
+    println!(
+        "Ready to {} ppdns:",
+        if reinstall { "reinstall" } else { "update" }
+    );
+    println!("  current: {current}");
+    println!("  target:  {desired_version}");
+    println!("  binary:  {}", current_exe.display());
+    println!("  source:  {url}");
+
+    if !prompt_confirm("Continue?", true)? {
+        println!("Cancelled.");
+        return Ok(());
+    }
+
+    let temp_dir = create_temp_workspace("ppdns-self-update")?;
+    let archive_path = temp_dir.join(&archive_name);
+
+    let result = (|| -> AppResult<()> {
+        download_to_path(global, &url, &archive_path)?;
+
+        run_system_status(
+            global,
+            "tar",
+            &[
+                "-xzf".to_string(),
+                archive_path.display().to_string(),
+                "-C".to_string(),
+                temp_dir.display().to_string(),
+            ],
+            false,
+        )?;
+
+        let binary_path = find_file_named(&temp_dir, "ppdns")?.ok_or_else(|| {
+            AppError::Message("could not find ppdns binary inside downloaded archive".to_string())
+        })?;
+
+        run_system_status(
+            global,
+            "install",
+            &[
+                "-m".to_string(),
+                "0755".to_string(),
+                binary_path.display().to_string(),
+                current_exe.display().to_string(),
+            ],
+            true,
+        )?;
+
+        Ok(())
+    })();
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    result?;
+
+    println!("ppdns {desired_version} installed.");
+    Ok(())
+}
+
+fn detect_powerdns_installed_version() -> AppResult<Option<String>> {
+    if command_exists("pdnsutil") {
+        let output = run_external_capture("pdnsutil", &["--version".to_string()])?;
+        if let Some(version) = extract_numeric_version(&output) {
+            return Ok(Some(version));
+        }
+    }
+
+    detect_dpkg_package_version("pdns-server")
+}
+
+fn detect_apt_candidate_version(package: &str) -> AppResult<Option<String>> {
+    let output = run_external_capture("apt-cache", &["policy".to_string(), package.to_string()])?;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(candidate) = trimmed.strip_prefix("Candidate:") {
+            let candidate = candidate.trim();
+            if candidate == "(none)" {
+                return Ok(None);
+            }
+            return Ok(Some(candidate.to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
+fn detect_dpkg_package_version(package: &str) -> AppResult<Option<String>> {
+    if !command_exists("dpkg-query") {
+        return Ok(None);
+    }
+
+    let output = run_shell_capture(&format!(
+        "dpkg-query -W -f='${{Version}}\\n' {} 2>/dev/null || true",
+        shell_quote(package)
+    ))?;
+    let version = output.trim();
+
+    if version.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(version.to_string()))
+    }
+}
+
+fn detect_installed_powerdns_packages() -> AppResult<Vec<String>> {
+    if !command_exists("dpkg-query") {
+        return Ok(Vec::new());
+    }
+
+    let output = run_shell_capture(
+        "dpkg-query -W -f='${Package}\\n' 'pdns-server' 'pdns-tools' 'pdns-backend-*' 2>/dev/null || true",
+    )?;
+    let mut packages: Vec<String> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    packages.sort();
+    packages.dedup();
+    Ok(packages)
+}
+
+fn prompt_powerdns_backend_package() -> AppResult<String> {
+    let labels = vec![
+        "gsqlite3 (Recommended)".to_string(),
+        "bind".to_string(),
+        "gmysql".to_string(),
+        "gpgsql".to_string(),
+    ];
+    let index = prompt_select("Choose a PowerDNS backend package", &labels)?;
+
+    Ok(match index {
+        0 => "pdns-backend-gsqlite3".to_string(),
+        1 => "pdns-backend-bind".to_string(),
+        2 => "pdns-backend-gmysql".to_string(),
+        3 => "pdns-backend-gpgsql".to_string(),
+        _ => unreachable!(),
+    })
+}
+
+fn fetch_latest_ppdns_version() -> AppResult<String> {
+    let body = fetch_url_text("https://api.github.com/repos/0x3st/ppdns/releases/latest")?;
+    extract_json_string_field(&body, "tag_name")
+        .map(|value| value.trim_start_matches('v').to_string())
+        .ok_or_else(|| AppError::Message("could not parse latest ppdns release".to_string()))
+}
+
+fn fetch_url_text(url: &str) -> AppResult<String> {
+    if command_exists("curl") {
+        run_external_capture(
+            "curl",
+            &[
+                "-fsSL".to_string(),
+                "--connect-timeout".to_string(),
+                "3".to_string(),
+                "--max-time".to_string(),
+                "5".to_string(),
+                "-H".to_string(),
+                "Accept: application/vnd.github+json".to_string(),
+                "-H".to_string(),
+                "User-Agent: ppdns".to_string(),
+                url.to_string(),
+            ],
+        )
+    } else if command_exists("wget") {
+        run_external_capture(
+            "wget",
+            &[
+                "-qO-".to_string(),
+                "--timeout=5".to_string(),
+                "--header=Accept: application/vnd.github+json".to_string(),
+                "--header=User-Agent: ppdns".to_string(),
+                url.to_string(),
+            ],
+        )
+    } else {
+        Err(AppError::Message(
+            "curl or wget is required to check the latest ppdns release".to_string(),
+        ))
+    }
+}
+
+fn download_to_path(global: &GlobalOptions, url: &str, path: &Path) -> AppResult<()> {
+    if command_exists("curl") {
+        run_system_status(
+            global,
+            "curl",
+            &[
+                "-fL".to_string(),
+                url.to_string(),
+                "-o".to_string(),
+                path.display().to_string(),
+            ],
+            false,
+        )
+    } else if command_exists("wget") {
+        run_system_status(
+            global,
+            "wget",
+            &[
+                "-O".to_string(),
+                path.display().to_string(),
+                url.to_string(),
+            ],
+            false,
+        )
+    } else {
+        Err(AppError::Message(
+            "curl or wget is required to download release files".to_string(),
+        ))
+    }
+}
+
+fn current_ppdns_target() -> AppResult<&'static str> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => Ok("x86_64-unknown-linux-musl"),
+        ("linux", "aarch64") => Ok("aarch64-unknown-linux-musl"),
+        _ => Err(AppError::Message(
+            "self-update currently supports Linux x86_64 and aarch64 only".to_string(),
+        )),
+    }
+}
+
+fn compare_numeric_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    let left_parts = parse_numeric_version_parts(left);
+    let right_parts = parse_numeric_version_parts(right);
+    let width = left_parts.len().max(right_parts.len());
+
+    for index in 0..width {
+        let left = *left_parts.get(index).unwrap_or(&0);
+        let right = *right_parts.get(index).unwrap_or(&0);
+
+        match left.cmp(&right) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+
+    std::cmp::Ordering::Equal
+}
+
+fn parse_numeric_version_parts(value: &str) -> Vec<u32> {
+    value
+        .trim_start_matches('v')
+        .split('.')
+        .map(|part| {
+            part.chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>()
+        })
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u32>().ok())
+        .collect()
+}
+
+fn extract_numeric_version(value: &str) -> Option<String> {
+    value
+        .split_whitespace()
+        .map(|token| token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.'))
+        .find(|token| {
+            token.chars().any(|ch| ch == '.') && token.chars().any(|ch| ch.is_ascii_digit())
+        })
+        .map(ToOwned::to_owned)
+}
+
+fn extract_json_string_field(body: &str, field: &str) -> Option<String> {
+    let pattern = format!("\"{field}\":");
+    let start = body.find(&pattern)?;
+    let after = &body[start + pattern.len()..];
+    let first_quote = after.find('"')?;
+    let rest = &after[first_quote + 1..];
+    let end_quote = rest.find('"')?;
+    Some(rest[..end_quote].to_string())
+}
+
+fn command_exists(command: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {} >/dev/null 2>&1", command))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn current_user_is_root() -> AppResult<bool> {
+    let output = run_external_capture("id", &["-u".to_string()])?;
+    Ok(output.trim() == "0")
+}
+
+fn ensure_command_available(command: &str) -> AppResult<()> {
+    if command_exists(command) {
+        Ok(())
+    } else {
+        Err(AppError::Message(format!(
+            "required command not found: `{command}`"
+        )))
+    }
+}
+
+fn run_external_capture(program: &str, args: &[String]) -> AppResult<String> {
+    let output = Command::new(program).args(args).output()?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(AppError::CommandFailed {
+            program: program.to_string(),
+            args: args.to_vec(),
+            status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
+
+fn run_shell_capture(script: &str) -> AppResult<String> {
+    run_external_capture("sh", &["-c".to_string(), script.to_string()])
+}
+
+fn run_system_status(
+    global: &GlobalOptions,
+    program: &str,
+    args: &[String],
+    require_root: bool,
+) -> AppResult<()> {
+    let (runner, runner_args) = build_system_command(program, args, require_root)?;
+    let preview = preview_external_command(&runner, &runner_args);
+
+    if global.dry_run {
+        println!("DRY RUN");
+        println!("{preview}");
+        return Ok(());
+    }
+
+    let output = Command::new(&runner).args(&runner_args).output()?;
+
+    if output.status.success() {
+        if !output.stdout.is_empty() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = stdout.trim();
+            if !stdout.is_empty() {
+                println!("{stdout}");
+            }
+        }
+        Ok(())
+    } else {
+        Err(AppError::CommandFailed {
+            program: runner,
+            args: runner_args,
+            status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
+
+fn build_system_command(
+    program: &str,
+    args: &[String],
+    require_root: bool,
+) -> AppResult<(String, Vec<String>)> {
+    if require_root && !current_user_is_root()? {
+        ensure_command_available("sudo")?;
+        let mut runner_args = vec![program.to_string()];
+        runner_args.extend(args.iter().cloned());
+        Ok(("sudo".to_string(), runner_args))
+    } else {
+        Ok((program.to_string(), args.to_vec()))
+    }
+}
+
+fn preview_external_command(program: &str, args: &[String]) -> String {
+    let mut items = vec![program.to_string()];
+    items.extend(args.iter().cloned());
+    items
+        .into_iter()
+        .map(|item| shell_quote(&item))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn create_temp_workspace(prefix: &str) -> AppResult<PathBuf> {
+    let dir = env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
+    if dir.exists() {
+        let _ = fs::remove_dir_all(&dir);
+    }
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn find_file_named(root: &Path, name: &str) -> AppResult<Option<PathBuf>> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            if let Some(found) = find_file_named(&path, name)? {
+                return Ok(Some(found));
+            }
+        } else if path.file_name().and_then(|value| value.to_str()) == Some(name) {
+            return Ok(Some(path));
+        }
+    }
+
+    Ok(None)
+}
+
 fn prompt_input(prompt: &str, default: Option<&str>) -> AppResult<String> {
     loop {
         match default {
@@ -1742,5 +2448,35 @@ mod tests {
                 "5.6.7.8".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn version_comparison_detects_newer_patch_release() {
+        assert!(compare_numeric_versions("1.0.2", "1.0.1").is_gt());
+        assert!(compare_numeric_versions("1.0.1", "1.0.1").is_eq());
+        assert!(compare_numeric_versions("1.0.0", "1.0.1").is_lt());
+    }
+
+    #[test]
+    fn home_actions_include_update_paths_when_available() {
+        let status = HomeStatus {
+            powerdns: PowerDnsStatus::Installed {
+                installed: "4.8.3".to_string(),
+                candidate: Some("5.0.0".to_string()),
+            },
+            ppdns: SelfStatus::LatestKnown {
+                current: "1.0.0".to_string(),
+                latest: "1.0.1".to_string(),
+                update_available: true,
+            },
+        };
+
+        let actions = build_home_actions(&status);
+        let labels: Vec<String> = actions.into_iter().map(|(label, _)| label).collect();
+
+        assert!(labels.contains(&"Update PowerDNS".to_string()));
+        assert!(labels.contains(&"Reinstall PowerDNS".to_string()));
+        assert!(labels.contains(&"Update ppdns".to_string()));
+        assert!(labels.contains(&"Reinstall ppdns".to_string()));
     }
 }
