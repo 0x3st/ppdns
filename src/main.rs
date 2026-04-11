@@ -1,3 +1,5 @@
+mod tui;
+
 use std::env;
 use std::fmt;
 use std::fs;
@@ -90,6 +92,7 @@ enum CommandKind {
     DeleteRecord(DeleteRecordArgs),
     ListZones,
     ListRecords(ListRecordsArgs),
+    Install(InstallArgs),
     Help,
 }
 
@@ -115,6 +118,12 @@ struct DeleteRecordArgs {
 #[derive(Debug, Default)]
 struct ListRecordsArgs {
     zone: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct InstallArgs {
+    target: Option<InstallTarget>,
+    action: Option<InstallMode>,
 }
 
 #[derive(Debug, Clone)]
@@ -172,25 +181,30 @@ struct PdnsUtil {
 
 const PPDNS_RELEASE_REPO: &str = "0x3st/ppdns";
 
-#[derive(Debug, Clone, Copy)]
-enum HomeAction {
-    AddRecord,
-    DeleteRecord,
-    ListZones,
-    ListRecords,
-    InstallPowerDns,
-    UpdatePowerDns,
-    ReinstallPowerDns,
-    UpdatePpdns,
-    ReinstallPpdns,
-    Exit,
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PackageAction {
     Install,
     Update,
     Reinstall,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallTarget {
+    PowerDns,
+    Ppdns,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallMode {
+    Install,
+    Update,
+    Reinstall,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallSelection {
+    PowerDns(PackageAction),
+    Ppdns { reinstall: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +309,9 @@ impl Cli {
                     }
                 }
             }
+            Some(command) if command == "install" => {
+                Some(CommandKind::Install(parse_install_args(&mut cursor)?))
+            }
             Some(command) => {
                 return Err(AppError::Message(format!("unknown command: `{command}`")))
             }
@@ -320,7 +337,7 @@ impl Cli {
                     print_help();
                     return Ok(());
                 }
-                interactive_home(&self.global)
+                tui::run(&self.global)
             }
             Some(CommandKind::AddRecord(args)) => {
                 let runner = PdnsUtil::new(self.global)?;
@@ -338,6 +355,7 @@ impl Cli {
                 let runner = PdnsUtil::new(self.global)?;
                 execute_list_records(&runner, args)
             }
+            Some(CommandKind::Install(args)) => execute_install_command(&self.global, args),
         }
     }
 }
@@ -771,6 +789,68 @@ fn parse_list_records_args(cursor: &mut ArgCursor) -> AppResult<ListRecordsArgs>
     Ok(args)
 }
 
+fn parse_install_args(cursor: &mut ArgCursor) -> AppResult<InstallArgs> {
+    let mut args = InstallArgs::default();
+
+    if let Some(token) = cursor.peek() {
+        match token {
+            "powerdns" | "pdns" => {
+                cursor.next();
+                args.target = Some(InstallTarget::PowerDns);
+            }
+            "ppdns" | "self" => {
+                cursor.next();
+                args.target = Some(InstallTarget::Ppdns);
+            }
+            "-h" | "--help" => {
+                cursor.next();
+                return Err(AppError::Message(
+                    "run `ppdns --help` for usage".to_string(),
+                ));
+            }
+            value if value.starts_with('-') => {}
+            value => {
+                return Err(AppError::Message(format!(
+                    "unsupported install target: `{value}`"
+                )))
+            }
+        }
+    }
+
+    while let Some(token) = cursor.peek() {
+        let mode = match token {
+            "--install" => InstallMode::Install,
+            "--update" => InstallMode::Update,
+            "--reinstall" => InstallMode::Reinstall,
+            "-h" | "--help" => {
+                cursor.next();
+                return Err(AppError::Message(
+                    "run `ppdns --help` for usage".to_string(),
+                ));
+            }
+            _ => break,
+        };
+
+        cursor.next();
+        set_install_mode(&mut args.action, mode)?;
+    }
+
+    Ok(args)
+}
+
+fn set_install_mode(slot: &mut Option<InstallMode>, value: InstallMode) -> AppResult<()> {
+    match slot {
+        Some(current) if *current != value => Err(AppError::Message(
+            "choose only one of `--install`, `--update`, or `--reinstall`".to_string(),
+        )),
+        Some(_) => Ok(()),
+        None => {
+            *slot = Some(value);
+            Ok(())
+        }
+    }
+}
+
 fn execute_add_record(runner: &PdnsUtil, args: AddRecordArgs) -> AppResult<()> {
     let skip_confirmation = args.yes;
     let spec = resolve_add_record_spec(runner, args)?;
@@ -884,52 +964,6 @@ fn handle_serial_bump_result(runner: &PdnsUtil, zone: &str, operation: &str) -> 
     }
 }
 
-fn interactive_home(global: &GlobalOptions) -> AppResult<()> {
-    loop {
-        let status = gather_home_status();
-        print_home_status(&status);
-
-        let actions = build_home_actions(&status);
-        let labels: Vec<String> = actions.iter().map(|(label, _)| label.clone()).collect();
-        let choice = prompt_select("Choose an action", &labels)?;
-
-        match actions[choice].1 {
-            HomeAction::AddRecord => {
-                let runner = PdnsUtil::new(global.clone())?;
-                execute_add_record(&runner, AddRecordArgs::default())?;
-            }
-            HomeAction::DeleteRecord => {
-                let runner = PdnsUtil::new(global.clone())?;
-                execute_delete_record(&runner, DeleteRecordArgs::default())?;
-            }
-            HomeAction::ListZones => {
-                let runner = PdnsUtil::new(global.clone())?;
-                print_zones(&runner.list_zones()?)?;
-            }
-            HomeAction::ListRecords => {
-                let runner = PdnsUtil::new(global.clone())?;
-                execute_list_records(&runner, ListRecordsArgs::default())?;
-            }
-            HomeAction::InstallPowerDns => {
-                execute_powerdns_package_action(global, PackageAction::Install)?;
-            }
-            HomeAction::UpdatePowerDns => {
-                execute_powerdns_package_action(global, PackageAction::Update)?;
-            }
-            HomeAction::ReinstallPowerDns => {
-                execute_powerdns_package_action(global, PackageAction::Reinstall)?;
-            }
-            HomeAction::UpdatePpdns => {
-                execute_self_update_action(global, false, Some(&status.ppdns))?;
-            }
-            HomeAction::ReinstallPpdns => {
-                execute_self_update_action(global, true, Some(&status.ppdns))?;
-            }
-            HomeAction::Exit => return Ok(()),
-        }
-    }
-}
-
 fn gather_home_status() -> HomeStatus {
     HomeStatus {
         powerdns: detect_powerdns_status(),
@@ -939,101 +973,185 @@ fn gather_home_status() -> HomeStatus {
 
 fn print_home_status(status: &HomeStatus) {
     println!("Status:");
+    println!("  {}", summarize_powerdns_status(&status.powerdns));
+    println!("  {}", summarize_self_status(&status.ppdns));
 
-    match &status.powerdns {
-        PowerDnsStatus::NotInstalled { candidate } => {
-            if let Some(candidate) = candidate {
-                println!("  PowerDNS: not installed, candidate in current repos: {candidate}");
-            } else {
-                println!("  PowerDNS: not installed");
-            }
-        }
+    println!();
+}
+
+fn summarize_powerdns_status(status: &PowerDnsStatus) -> String {
+    match status {
+        PowerDnsStatus::NotInstalled { candidate } => candidate.as_ref().map_or_else(
+            || "PowerDNS: not installed".to_string(),
+            |candidate| format!("PowerDNS: not installed, candidate in current repos: {candidate}"),
+        ),
         PowerDnsStatus::Installed {
             installed,
             candidate,
-        } => {
-            if let Some(candidate) = candidate {
-                if powerdns_update_available(installed, candidate) {
-                    println!(
-                        "  PowerDNS: installed {installed}, candidate {candidate} in current repos"
-                    );
-                } else {
-                    println!("  PowerDNS: installed {installed}, up to date in current repos");
-                }
-            } else {
-                println!("  PowerDNS: installed {installed}");
+        } => match candidate {
+            Some(candidate) if powerdns_update_available(installed, candidate) => {
+                format!("PowerDNS: installed {installed}, candidate {candidate} in current repos")
             }
-        }
+            Some(_) => format!("PowerDNS: installed {installed}, up to date in current repos"),
+            None => format!("PowerDNS: installed {installed}"),
+        },
         PowerDnsStatus::Unsupported { reason } => {
-            println!("  PowerDNS: status check unavailable ({reason})");
+            format!("PowerDNS: status check unavailable ({reason})")
         }
     }
+}
 
-    match &status.ppdns {
+fn summarize_self_status(status: &SelfStatus) -> String {
+    match status {
         SelfStatus::LatestKnown {
             current,
             latest,
             update_available,
         } => {
             if *update_available {
-                println!("  ppdns: current {current}, latest {latest}");
+                format!("ppdns: current {current}, latest {latest}")
             } else {
-                println!("  ppdns: current {current}, up to date");
+                format!("ppdns: current {current}, up to date")
             }
         }
         SelfStatus::UnknownLatest { current, reason } => {
-            println!("  ppdns: current {current}, latest check unavailable ({reason})");
+            format!("ppdns: current {current}, latest check unavailable ({reason})")
         }
     }
-
-    println!();
 }
 
-fn build_home_actions(status: &HomeStatus) -> Vec<(String, HomeAction)> {
-    let mut actions = vec![
-        ("Add record".to_string(), HomeAction::AddRecord),
-        ("Delete record".to_string(), HomeAction::DeleteRecord),
-        ("List zones".to_string(), HomeAction::ListZones),
-        ("List records".to_string(), HomeAction::ListRecords),
-    ];
+fn execute_install_command(global: &GlobalOptions, args: InstallArgs) -> AppResult<()> {
+    let status = gather_home_status();
+    print_home_status(&status);
 
-    match &status.powerdns {
-        PowerDnsStatus::NotInstalled { .. } => {
-            actions.push(("Install PowerDNS".to_string(), HomeAction::InstallPowerDns));
-        }
-        PowerDnsStatus::Installed {
-            installed,
-            candidate,
-        } => {
-            if candidate
-                .as_ref()
-                .is_some_and(|candidate| powerdns_update_available(installed, candidate))
-            {
-                actions.push(("Update PowerDNS".to_string(), HomeAction::UpdatePowerDns));
+    let target = match args.target {
+        Some(target) => target,
+        None if stdin_is_interactive() => {
+            let options = vec!["PowerDNS".to_string(), "ppdns".to_string()];
+            match prompt_select("Choose what to install or update", &options)? {
+                0 => InstallTarget::PowerDns,
+                1 => InstallTarget::Ppdns,
+                _ => unreachable!(),
             }
-            actions.push((
-                "Reinstall PowerDNS".to_string(),
-                HomeAction::ReinstallPowerDns,
-            ));
         }
-        PowerDnsStatus::Unsupported { .. } => {}
-    }
+        None => {
+            return Err(AppError::Message(
+                "missing install target; use `ppdns install powerdns` or `ppdns install ppdns`"
+                    .to_string(),
+            ))
+        }
+    };
 
-    match &status.ppdns {
-        SelfStatus::LatestKnown {
-            update_available: true,
-            ..
-        } => {
-            actions.push(("Update ppdns".to_string(), HomeAction::UpdatePpdns));
-            actions.push(("Reinstall ppdns".to_string(), HomeAction::ReinstallPpdns));
+    let selection = match args.action {
+        Some(action) => install_selection_from_args(target, action),
+        None if stdin_is_interactive() => {
+            let actions = build_install_actions(&status, target);
+            if actions.is_empty() {
+                return Err(AppError::Message(match target {
+                    InstallTarget::PowerDns => {
+                        "PowerDNS install actions are unavailable on this system".to_string()
+                    }
+                    InstallTarget::Ppdns => {
+                        "no ppdns install actions are available right now".to_string()
+                    }
+                }));
+            }
+
+            let labels: Vec<String> = actions.iter().map(|(label, _)| label.clone()).collect();
+            let choice = prompt_select("Choose an install action", &labels)?;
+            actions[choice].1
         }
-        SelfStatus::LatestKnown { .. } | SelfStatus::UnknownLatest { .. } => {
-            actions.push(("Reinstall ppdns".to_string(), HomeAction::ReinstallPpdns));
+        None => {
+            return Err(AppError::Message(
+                "missing install action; use `--install`, `--update`, or `--reinstall`".to_string(),
+            ))
+        }
+    };
+
+    match selection {
+        InstallSelection::PowerDns(action) => execute_powerdns_package_action(global, action),
+        InstallSelection::Ppdns { reinstall } => {
+            execute_self_update_action(global, reinstall, Some(&status.ppdns))
         }
     }
+}
 
-    actions.push(("Exit".to_string(), HomeAction::Exit));
-    actions
+fn install_selection_from_args(target: InstallTarget, action: InstallMode) -> InstallSelection {
+    match target {
+        InstallTarget::PowerDns => InstallSelection::PowerDns(match action {
+            InstallMode::Install => PackageAction::Install,
+            InstallMode::Update => PackageAction::Update,
+            InstallMode::Reinstall => PackageAction::Reinstall,
+        }),
+        InstallTarget::Ppdns => InstallSelection::Ppdns {
+            reinstall: matches!(action, InstallMode::Reinstall),
+        },
+    }
+}
+
+fn build_install_actions(
+    status: &HomeStatus,
+    target: InstallTarget,
+) -> Vec<(String, InstallSelection)> {
+    match target {
+        InstallTarget::PowerDns => match &status.powerdns {
+            PowerDnsStatus::NotInstalled { .. } => vec![(
+                "Install PowerDNS".to_string(),
+                InstallSelection::PowerDns(PackageAction::Install),
+            )],
+            PowerDnsStatus::Installed {
+                installed,
+                candidate,
+            } => {
+                let mut actions = Vec::new();
+                if candidate
+                    .as_ref()
+                    .is_some_and(|candidate| powerdns_update_available(installed, candidate))
+                {
+                    actions.push((
+                        "Update PowerDNS".to_string(),
+                        InstallSelection::PowerDns(PackageAction::Update),
+                    ));
+                }
+                actions.push((
+                    "Reinstall PowerDNS".to_string(),
+                    InstallSelection::PowerDns(PackageAction::Reinstall),
+                ));
+                actions
+            }
+            PowerDnsStatus::Unsupported { .. } => Vec::new(),
+        },
+        InstallTarget::Ppdns => match &status.ppdns {
+            SelfStatus::LatestKnown {
+                update_available: true,
+                latest,
+                ..
+            } => vec![
+                (
+                    format!("Update ppdns to {latest}"),
+                    InstallSelection::Ppdns { reinstall: false },
+                ),
+                (
+                    "Reinstall current ppdns".to_string(),
+                    InstallSelection::Ppdns { reinstall: true },
+                ),
+            ],
+            SelfStatus::LatestKnown { .. } => vec![(
+                "Reinstall current ppdns".to_string(),
+                InstallSelection::Ppdns { reinstall: true },
+            )],
+            SelfStatus::UnknownLatest { .. } => vec![
+                (
+                    "Update ppdns (check latest again)".to_string(),
+                    InstallSelection::Ppdns { reinstall: false },
+                ),
+                (
+                    "Reinstall current ppdns".to_string(),
+                    InstallSelection::Ppdns { reinstall: true },
+                ),
+            ],
+        },
+    }
 }
 
 fn resolve_add_record_spec(runner: &PdnsUtil, args: AddRecordArgs) -> AppResult<AddRecordSpec> {
@@ -1485,10 +1603,11 @@ fn parse_origin_directive(line: &str, current_origin: &str) -> Option<String> {
 }
 
 fn print_help() {
-    println!("ppdns - guided PowerDNS CLI");
+    println!("ppdns - guided PowerDNS DNS panel");
     println!();
     println!("Usage:");
-    println!("  ppdns");
+    println!("  ppdns                        # full-screen TUI");
+    println!("  ppdns install [powerdns|ppdns] [--install|--update|--reinstall]");
     println!("  ppdns add record [--zone ZONE] [--name NAME] [--type TYPE] [--content CONTENT] [--ttl TTL] [-y]");
     println!(
         "  ppdns delete record [--zone ZONE] [--name NAME] [--type TYPE] [--content CONTENT] [-y]"
@@ -2676,7 +2795,7 @@ mod tests {
     }
 
     #[test]
-    fn home_actions_include_update_paths_when_available() {
+    fn install_actions_include_update_paths_when_available() {
         let status = HomeStatus {
             powerdns: PowerDnsStatus::Installed {
                 installed: "4.8.3".to_string(),
@@ -2689,17 +2808,22 @@ mod tests {
             },
         };
 
-        let actions = build_home_actions(&status);
-        let labels: Vec<String> = actions.into_iter().map(|(label, _)| label).collect();
+        let powerdns_actions = build_install_actions(&status, InstallTarget::PowerDns);
+        let powerdns_labels: Vec<String> = powerdns_actions
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        let self_actions = build_install_actions(&status, InstallTarget::Ppdns);
+        let self_labels: Vec<String> = self_actions.into_iter().map(|(label, _)| label).collect();
 
-        assert!(labels.contains(&"Update PowerDNS".to_string()));
-        assert!(labels.contains(&"Reinstall PowerDNS".to_string()));
-        assert!(labels.contains(&"Update ppdns".to_string()));
-        assert!(labels.contains(&"Reinstall ppdns".to_string()));
+        assert!(powerdns_labels.contains(&"Update PowerDNS".to_string()));
+        assert!(powerdns_labels.contains(&"Reinstall PowerDNS".to_string()));
+        assert!(self_labels.contains(&"Update ppdns to 1.0.1".to_string()));
+        assert!(self_labels.contains(&"Reinstall current ppdns".to_string()));
     }
 
     #[test]
-    fn home_actions_hide_powerdns_update_when_candidate_is_same() {
+    fn install_actions_hide_powerdns_update_when_candidate_is_same() {
         let status = HomeStatus {
             powerdns: PowerDnsStatus::Installed {
                 installed: "4.8.3-4build3".to_string(),
@@ -2712,7 +2836,7 @@ mod tests {
             },
         };
 
-        let actions = build_home_actions(&status);
+        let actions = build_install_actions(&status, InstallTarget::PowerDns);
         let labels: Vec<String> = actions.into_iter().map(|(label, _)| label).collect();
 
         assert!(!labels.contains(&"Update PowerDNS".to_string()));

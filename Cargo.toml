@@ -2,5 +2,8 @@
 name = "ppdns"
 version = "1.0.2"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
+crossterm = "=0.28.1"
+ratatui = { version = "=0.29.0", default-features = false, features = ["crossterm"] }

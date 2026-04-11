@@ -95,3 +95,4 @@ jobs:
           body_path: release-notes.md
           files: release/*
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

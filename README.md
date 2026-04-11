@@ -1,6 +1,6 @@
 # ppdns
 
-`ppdns` is a guided PowerDNS CLI written in Rust.
+`ppdns` is a guided PowerDNS DNS panel written in Rust.
 
 It wraps `pdnsutil` and focuses on the common workflow that operators use most often:
 
@@ -9,14 +9,15 @@ It wraps `pdnsutil` and focuses on the common workflow that operators use most o
 - list zones
 - list records inside a zone
 
-The main goal is to lower the learning cost of `pdnsutil` by giving you an interactive guide instead of asking you to remember the full command syntax.
+The main goal is to lower the learning cost of `pdnsutil` by giving you an interactive panel instead of asking you to remember the full command syntax.
 
 ## Features
 
-- Guided mode: run `ppdns` or `ppdns add record` and fill the missing fields step by step.
+- Full-screen TUI: run `ppdns` to open a Cloudflare-style DNS panel in the terminal.
+- Guided CLI: run `ppdns add record` or `ppdns delete record` and fill the missing fields step by step.
 - Safer single-record deletion: if one RRset has multiple values, `ppdns` only removes the selected value and keeps the others.
 - Supports both legacy `pdnsutil` 4.x commands and modern PowerDNS 5.x object-style commands.
-- No external Rust dependencies, so it can compile offline.
+- `ppdns install` can install, update, or reinstall PowerDNS packages and `ppdns` itself.
 - Still scriptable: you can pass flags directly when you do not want the guide.
 
 ## Install on Linux
@@ -33,6 +34,12 @@ Install a specific version:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/0x3st/ppdns/main/scripts/install.sh | sh -s -- --version 1.0.2
+```
+
+Install an alpha or other prerelease:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/0x3st/ppdns/main/scripts/install.sh | sh -s -- --version 1.1.0-alpha.1
 ```
 
 Install to a custom directory:
@@ -84,12 +91,22 @@ This creates:
 
 The GitHub Actions workflow is designed to build and publish Linux binaries on `v*` tags, with version checks against `Cargo.toml` and `CHANGELOG.md`. The published Release body starts with the matching `CHANGELOG.md` section, and GitHub-generated release notes are appended after it.
 
+If the tag includes a prerelease suffix such as `v1.1.0-alpha.1` or `v1.1.0-rc.1`, GitHub Releases will mark it as a prerelease automatically.
+
 ## Quick Start
 
-Interactive entry:
+Open the TUI:
 
 ```bash
 cargo run
+```
+
+Use the install manager:
+
+```bash
+cargo run -- install
+cargo run -- install powerdns
+cargo run -- install ppdns --reinstall
 ```
 
 Guided add:
@@ -159,6 +176,14 @@ Global flags:
 - `--config-name NAME`
 - `--dry-run`
 
+Install flags:
+
+- `powerdns`
+- `ppdns`
+- `--install`
+- `--update`
+- `--reinstall`
+
 Add flags:
 
 - `--zone ZONE`
@@ -178,6 +203,8 @@ Delete flags:
 
 ## Notes
 
+- The default `ppdns` entry opens the full-screen TUI.
+- Use `ppdns install` for PowerDNS package management and ppdns self-update flows.
 - This tool currently focuses on single-record add/delete workflows.
 - Record names are normalized for convenience:
   - `@` becomes the zone apex
