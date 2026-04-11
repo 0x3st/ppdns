@@ -15,6 +15,7 @@ The main goal is to lower the learning cost of `pdnsutil` by giving you an inter
 
 - Guided mode: run `ppdns` or `ppdns add record` and fill the missing fields step by step.
 - Safer single-record deletion: if one RRset has multiple values, `ppdns` only removes the selected value and keeps the others.
+- Supports both legacy `pdnsutil` 4.x commands and modern PowerDNS 5.x object-style commands.
 - No external Rust dependencies, so it can compile offline.
 - Still scriptable: you can pass flags directly when you do not want the guide.
 
@@ -31,7 +32,7 @@ curl -fsSL https://raw.githubusercontent.com/0x3st/ppdns/main/scripts/install.sh
 Install a specific version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/0x3st/ppdns/main/scripts/install.sh | sh -s -- --version 1.0.0
+curl -fsSL https://raw.githubusercontent.com/0x3st/ppdns/main/scripts/install.sh | sh -s -- --version 1.0.1
 ```
 
 Install to a custom directory:

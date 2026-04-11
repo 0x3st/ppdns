@@ -157,8 +157,15 @@ struct DeletePlan {
     method: DeleteMethod,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PdnsSyntax {
+    Modern,
+    Legacy,
+}
+
 struct PdnsUtil {
     global: GlobalOptions,
+    syntax: PdnsSyntax,
 }
 
 fn main() {
@@ -281,7 +288,20 @@ impl Cli {
 impl PdnsUtil {
     fn new(global: GlobalOptions) -> AppResult<Self> {
         match Command::new(&global.pdnsutil_bin).arg("--help").output() {
-            Ok(_) => Ok(Self { global }),
+            Ok(output) => {
+                let mut help_output = String::from_utf8_lossy(&output.stdout).into_owned();
+                if !output.stderr.is_empty() {
+                    if !help_output.is_empty() {
+                        help_output.push('\n');
+                    }
+                    help_output.push_str(&String::from_utf8_lossy(&output.stderr));
+                }
+
+                Ok(Self {
+                    global,
+                    syntax: detect_pdns_syntax(&help_output),
+                })
+            }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Err(AppError::Message(format!(
                 "cannot find `{}`. Install pdnsutil or pass `--pdnsutil /path/to/pdnsutil`.",
                 global.pdnsutil_bin
@@ -291,7 +311,8 @@ impl PdnsUtil {
     }
 
     fn list_zones(&self) -> AppResult<Vec<String>> {
-        let output = self.run_capture(&["zone", "list-all"])?;
+        let args = self.list_zones_args();
+        let output = self.run_capture(&args)?;
         let mut zones: Vec<String> = output
             .lines()
             .map(str::trim)
@@ -304,7 +325,8 @@ impl PdnsUtil {
     }
 
     fn list_zone_records(&self, zone: &str) -> AppResult<Vec<ZoneRecord>> {
-        let output = self.run_capture(&["zone", "list", zone])?;
+        let args = self.list_zone_records_args(zone);
+        let output = self.run_capture(&args)?;
         let mut current_origin = normalize_zone_name(zone);
         let mut records = Vec::new();
 
@@ -332,51 +354,13 @@ impl PdnsUtil {
     }
 
     fn add_record(&self, spec: &AddRecordSpec) -> AppResult<()> {
-        let mut args = vec![
-            "rrset".to_string(),
-            "add".to_string(),
-            spec.zone.clone(),
-            spec.name.clone(),
-            spec.record_type.clone(),
-        ];
-
-        if let Some(ttl) = spec.ttl {
-            args.push(ttl.to_string());
-        }
-
-        args.push(spec.content.clone());
+        let args = self.add_record_args(spec);
         self.run_status(&args)
     }
 
     fn apply_delete_plan(&self, plan: &DeletePlan) -> AppResult<()> {
-        match &plan.method {
-            DeleteMethod::DeleteRrset => self.run_status(&[
-                "rrset".to_string(),
-                "delete".to_string(),
-                plan.zone.clone(),
-                plan.name.clone(),
-                plan.record_type.clone(),
-            ]),
-            DeleteMethod::Replace {
-                ttl,
-                remaining_contents,
-            } => {
-                let mut args = vec![
-                    "rrset".to_string(),
-                    "replace".to_string(),
-                    plan.zone.clone(),
-                    plan.name.clone(),
-                    plan.record_type.clone(),
-                ];
-
-                if let Some(ttl) = ttl {
-                    args.push(ttl.to_string());
-                }
-
-                args.extend(remaining_contents.iter().cloned());
-                self.run_status(&args)
-            }
-        }
+        let args = self.delete_plan_args(plan);
+        self.run_status(&args)
     }
 
     fn preview_command(&self, args: &[String]) -> String {
@@ -399,7 +383,109 @@ impl PdnsUtil {
             .join(" ")
     }
 
-    fn run_capture(&self, args: &[&str]) -> AppResult<String> {
+    fn list_zones_args(&self) -> Vec<String> {
+        match self.syntax {
+            PdnsSyntax::Modern => vec!["zone".to_string(), "list-all".to_string()],
+            PdnsSyntax::Legacy => vec!["list-all-zones".to_string()],
+        }
+    }
+
+    fn list_zone_records_args(&self, zone: &str) -> Vec<String> {
+        match self.syntax {
+            PdnsSyntax::Modern => {
+                vec!["zone".to_string(), "list".to_string(), zone.to_string()]
+            }
+            PdnsSyntax::Legacy => vec!["list-zone".to_string(), zone.to_string()],
+        }
+    }
+
+    fn add_record_args(&self, spec: &AddRecordSpec) -> Vec<String> {
+        let mut args = match self.syntax {
+            PdnsSyntax::Modern => vec![
+                "rrset".to_string(),
+                "add".to_string(),
+                spec.zone.clone(),
+                spec.name.clone(),
+                spec.record_type.clone(),
+            ],
+            PdnsSyntax::Legacy => vec![
+                "add-record".to_string(),
+                spec.zone.clone(),
+                spec.name.clone(),
+                spec.record_type.clone(),
+            ],
+        };
+
+        if let Some(ttl) = spec.ttl {
+            args.push(ttl.to_string());
+        }
+
+        args.push(spec.content.clone());
+        args
+    }
+
+    fn delete_plan_args(&self, plan: &DeletePlan) -> Vec<String> {
+        match (&self.syntax, &plan.method) {
+            (PdnsSyntax::Modern, DeleteMethod::DeleteRrset) => vec![
+                "rrset".to_string(),
+                "delete".to_string(),
+                plan.zone.clone(),
+                plan.name.clone(),
+                plan.record_type.clone(),
+            ],
+            (PdnsSyntax::Legacy, DeleteMethod::DeleteRrset) => vec![
+                "delete-rrset".to_string(),
+                plan.zone.clone(),
+                plan.name.clone(),
+                plan.record_type.clone(),
+            ],
+            (
+                PdnsSyntax::Modern,
+                DeleteMethod::Replace {
+                    ttl,
+                    remaining_contents,
+                },
+            ) => {
+                let mut args = vec![
+                    "rrset".to_string(),
+                    "replace".to_string(),
+                    plan.zone.clone(),
+                    plan.name.clone(),
+                    plan.record_type.clone(),
+                ];
+
+                if let Some(ttl) = ttl {
+                    args.push(ttl.to_string());
+                }
+
+                args.extend(remaining_contents.iter().cloned());
+                args
+            }
+            (
+                PdnsSyntax::Legacy,
+                DeleteMethod::Replace {
+                    ttl,
+                    remaining_contents,
+                },
+            ) => {
+                let mut args = vec![
+                    "replace-rrset".to_string(),
+                    plan.zone.clone(),
+                    plan.name.clone(),
+                    plan.record_type.clone(),
+                ];
+
+                if let Some(ttl) = ttl {
+                    args.push(ttl.to_string());
+                }
+
+                args.extend(remaining_contents.iter().cloned());
+                args
+            }
+        }
+    }
+
+    fn run_capture(&self, args: &[String]) -> AppResult<String> {
         let mut command = Command::new(&self.global.pdnsutil_bin);
         self.apply_global_args(&mut command);
         command.args(args);
@@ -410,7 +496,7 @@ impl PdnsUtil {
         } else {
             Err(AppError::CommandFailed {
                 program: self.global.pdnsutil_bin.clone(),
-                args: args.iter().map(|arg| (*arg).to_string()).collect(),
+                args: args.to_vec(),
                 status: output.status,
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             })
@@ -616,7 +702,7 @@ fn execute_add_record(runner: &PdnsUtil, args: AddRecordArgs) -> AppResult<()> {
     let skip_confirmation = args.yes;
     let spec = resolve_add_record_spec(runner, args)?;
 
-    let preview = build_add_command_args(&spec);
+    let preview = runner.add_record_args(&spec);
     println!("Ready to add:");
     println!("  zone:    {}", spec.zone);
     println!("  name:    {}", spec.name);
@@ -644,7 +730,7 @@ fn execute_delete_record(runner: &PdnsUtil, args: DeleteRecordArgs) -> AppResult
     let skip_confirmation = args.yes;
     let (spec, plan) = resolve_delete_record_plan(runner, args)?;
 
-    let preview = build_delete_command_args(&plan);
+    let preview = runner.delete_plan_args(&plan);
     println!("Ready to delete:");
     println!("  zone:    {}", spec.zone);
     println!("  name:    {}", spec.name);
@@ -1072,54 +1158,6 @@ fn build_delete_plan(
     })
 }
 
-fn build_add_command_args(spec: &AddRecordSpec) -> Vec<String> {
-    let mut args = vec![
-        "rrset".to_string(),
-        "add".to_string(),
-        spec.zone.clone(),
-        spec.name.clone(),
-        spec.record_type.clone(),
-    ];
-
-    if let Some(ttl) = spec.ttl {
-        args.push(ttl.to_string());
-    }
-
-    args.push(spec.content.clone());
-    args
-}
-
-fn build_delete_command_args(plan: &DeletePlan) -> Vec<String> {
-    match &plan.method {
-        DeleteMethod::DeleteRrset => vec![
-            "rrset".to_string(),
-            "delete".to_string(),
-            plan.zone.clone(),
-            plan.name.clone(),
-            plan.record_type.clone(),
-        ],
-        DeleteMethod::Replace {
-            ttl,
-            remaining_contents,
-        } => {
-            let mut args = vec![
-                "rrset".to_string(),
-                "replace".to_string(),
-                plan.zone.clone(),
-                plan.name.clone(),
-                plan.record_type.clone(),
-            ];
-
-            if let Some(ttl) = ttl {
-                args.push(ttl.to_string());
-            }
-
-            args.extend(remaining_contents.iter().cloned());
-            args
-        }
-    }
-}
-
 fn filter_records(
     records: &[ZoneRecord],
     name: Option<&str>,
@@ -1514,6 +1552,21 @@ fn is_help(value: &str) -> bool {
     matches!(value, "-h" | "--help" | "help")
 }
 
+fn detect_pdns_syntax(help_output: &str) -> PdnsSyntax {
+    let normalized = help_output.to_ascii_lowercase();
+
+    if normalized.contains("zone list-all") || normalized.contains("rrset add") {
+        PdnsSyntax::Modern
+    } else if normalized.contains("list-all-zones")
+        || normalized.contains("add-record")
+        || normalized.contains("replace-rrset")
+    {
+        PdnsSyntax::Legacy
+    } else {
+        PdnsSyntax::Modern
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1621,5 +1674,73 @@ mod tests {
             build_delete_plan("example.com.", &records, &spec).expect("delete plan should build");
 
         assert!(matches!(plan.method, DeleteMethod::DeleteRrset));
+    }
+
+    #[test]
+    fn detects_legacy_pdnsutil_syntax() {
+        let help = "Commands:\nlist-all-zones\nlist-zone ZONE\nadd-record ZONE NAME TYPE";
+        assert_eq!(detect_pdns_syntax(help), PdnsSyntax::Legacy);
+    }
+
+    #[test]
+    fn detects_modern_pdnsutil_syntax() {
+        let help = "Commands:\nzone list-all\nzone list ZONE\nrrset add ZONE NAME TYPE";
+        assert_eq!(detect_pdns_syntax(help), PdnsSyntax::Modern);
+    }
+
+    #[test]
+    fn legacy_add_command_uses_old_pdnsutil_form() {
+        let runner = PdnsUtil {
+            global: GlobalOptions::default(),
+            syntax: PdnsSyntax::Legacy,
+        };
+        let spec = AddRecordSpec {
+            zone: "example.com.".to_string(),
+            name: "www.example.com.".to_string(),
+            record_type: "A".to_string(),
+            content: "1.2.3.4".to_string(),
+            ttl: Some(300),
+        };
+
+        assert_eq!(
+            runner.add_record_args(&spec),
+            vec![
+                "add-record".to_string(),
+                "example.com.".to_string(),
+                "www.example.com.".to_string(),
+                "A".to_string(),
+                "300".to_string(),
+                "1.2.3.4".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_delete_replace_uses_old_pdnsutil_form() {
+        let runner = PdnsUtil {
+            global: GlobalOptions::default(),
+            syntax: PdnsSyntax::Legacy,
+        };
+        let plan = DeletePlan {
+            zone: "example.com.".to_string(),
+            name: "www.example.com.".to_string(),
+            record_type: "A".to_string(),
+            method: DeleteMethod::Replace {
+                ttl: Some(300),
+                remaining_contents: vec!["5.6.7.8".to_string()],
+            },
+        };
+
+        assert_eq!(
+            runner.delete_plan_args(&plan),
+            vec![
+                "replace-rrset".to_string(),
+                "example.com.".to_string(),
+                "www.example.com.".to_string(),
+                "A".to_string(),
+                "300".to_string(),
+                "5.6.7.8".to_string()
+            ]
+        );
     }
 }
