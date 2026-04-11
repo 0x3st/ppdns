@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.2] - 2026-04-11
+
+### Added
+
+- Automatically increase the SOA serial after successful record add and delete operations.
+
+### Fixed
+
+- Improved the delete-record guide to narrow selection by record name, then type, then value.
+- Improved PowerDNS package version detection so package revisions like `4.8.3-4build3` are not shown as false updates.
+- Adjusted the default SQLite backend package recommendation for apt-based systems.
+
 ## [1.0.1] - 2026-04-11
 
 ### Fixed

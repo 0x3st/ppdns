@@ -420,6 +420,11 @@ impl PdnsUtil {
         self.run_status(&args)
     }
 
+    fn increase_serial(&self, zone: &str) -> AppResult<()> {
+        let args = self.increase_serial_args(zone);
+        self.run_status(&args)
+    }
+
     fn preview_command(&self, args: &[String]) -> String {
         let mut full = vec![self.global.pdnsutil_bin.clone()];
 
@@ -479,6 +484,17 @@ impl PdnsUtil {
 
         args.push(spec.content.clone());
         args
+    }
+
+    fn increase_serial_args(&self, zone: &str) -> Vec<String> {
+        match self.syntax {
+            PdnsSyntax::Modern => vec![
+                "zone".to_string(),
+                "increase-serial".to_string(),
+                zone.to_string(),
+            ],
+            PdnsSyntax::Legacy => vec!["increase-serial".to_string(), zone.to_string()],
+        }
     }
 
     fn delete_plan_args(&self, plan: &DeletePlan) -> Vec<String> {
@@ -780,6 +796,7 @@ fn execute_add_record(runner: &PdnsUtil, args: AddRecordArgs) -> AppResult<()> {
 
     runner.add_record(&spec)?;
     println!("Record added.");
+    handle_serial_bump_result(runner, &spec.zone, "add")?;
     Ok(())
 }
 
@@ -793,6 +810,10 @@ fn execute_delete_record(runner: &PdnsUtil, args: DeleteRecordArgs) -> AppResult
     println!("  name:    {}", spec.name);
     println!("  type:    {}", spec.record_type);
     println!("  content: {}", spec.content);
+
+    if is_sensitive_delete(&spec) {
+        println!("  warning: this is a sensitive record type; double-check before deleting it");
+    }
 
     match &plan.method {
         DeleteMethod::DeleteRrset => {
@@ -823,6 +844,7 @@ fn execute_delete_record(runner: &PdnsUtil, args: DeleteRecordArgs) -> AppResult
 
     runner.apply_delete_plan(&plan)?;
     println!("Record deleted.");
+    handle_serial_bump_result(runner, &spec.zone, "delete")?;
     Ok(())
 }
 
@@ -841,6 +863,25 @@ fn execute_list_records(runner: &PdnsUtil, args: ListRecordsArgs) -> AppResult<(
 
     let records = runner.list_zone_records(&zone)?;
     print_records(&zone, &records)
+}
+
+fn handle_serial_bump_result(runner: &PdnsUtil, zone: &str, operation: &str) -> AppResult<()> {
+    match runner.increase_serial(zone) {
+        Ok(()) => {
+            if runner.global.dry_run {
+                println!("SOA serial bump planned.");
+            } else {
+                println!("SOA serial increased.");
+            }
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!(
+                "Warning: record {operation} succeeded, but failed to increase SOA serial for `{zone}`: {err}"
+            );
+            Ok(())
+        }
+    }
 }
 
 fn interactive_home(global: &GlobalOptions) -> AppResult<()> {
@@ -912,7 +953,7 @@ fn print_home_status(status: &HomeStatus) {
             candidate,
         } => {
             if let Some(candidate) = candidate {
-                if candidate != installed {
+                if powerdns_update_available(installed, candidate) {
                     println!(
                         "  PowerDNS: installed {installed}, candidate {candidate} in current repos"
                     );
@@ -966,7 +1007,7 @@ fn build_home_actions(status: &HomeStatus) -> Vec<(String, HomeAction)> {
         } => {
             if candidate
                 .as_ref()
-                .is_some_and(|candidate| candidate != installed)
+                .is_some_and(|candidate| powerdns_update_available(installed, candidate))
             {
                 actions.push(("Update PowerDNS".to_string(), HomeAction::UpdatePowerDns));
             }
@@ -1238,6 +1279,44 @@ fn select_record_for_delete(
 
     if candidates.len() == 1 {
         return Ok(candidates.remove(0));
+    }
+
+    if name.is_none() {
+        let names = collect_unique_name_options(&candidates);
+        if names.len() > 1 {
+            let labels: Vec<String> = names
+                .iter()
+                .map(|(name, count)| format!("{name} ({count} record(s))"))
+                .collect();
+            let index = prompt_select("Choose a record name", &labels)?;
+            candidates.retain(|record| record.name == names[index].0);
+        }
+    }
+
+    if candidates.len() == 1 {
+        return Ok(candidates.remove(0));
+    }
+
+    if record_type.is_none() {
+        let record_types = collect_unique_type_options(&candidates);
+        if record_types.len() > 1 {
+            let labels: Vec<String> = record_types
+                .iter()
+                .map(|(record_type, count)| format!("{record_type} ({count} record(s))"))
+                .collect();
+            let index = prompt_select("Choose a record type", &labels)?;
+            candidates.retain(|record| record.record_type == record_types[index].0);
+        }
+    }
+
+    if candidates.len() == 1 {
+        return Ok(candidates.remove(0));
+    }
+
+    if content.is_none() {
+        let labels: Vec<String> = candidates.iter().map(format_record_value_label).collect();
+        let index = prompt_select("Choose the record value to delete", &labels)?;
+        return Ok(candidates[index].clone());
     }
 
     while candidates.len() > 30 {
@@ -1673,6 +1752,10 @@ fn execute_self_update_action(
 }
 
 fn detect_powerdns_installed_version() -> AppResult<Option<String>> {
+    if let Some(version) = detect_dpkg_package_version("pdns-server")? {
+        return Ok(Some(version));
+    }
+
     if command_exists("pdnsutil") {
         let output = run_external_capture("pdnsutil", &["--version".to_string()])?;
         if let Some(version) = extract_numeric_version(&output) {
@@ -1680,7 +1763,7 @@ fn detect_powerdns_installed_version() -> AppResult<Option<String>> {
         }
     }
 
-    detect_dpkg_package_version("pdns-server")
+    Ok(None)
 }
 
 fn detect_apt_candidate_version(package: &str) -> AppResult<Option<String>> {
@@ -1739,7 +1822,7 @@ fn detect_installed_powerdns_packages() -> AppResult<Vec<String>> {
 
 fn prompt_powerdns_backend_package() -> AppResult<String> {
     let labels = vec![
-        "gsqlite3 (Recommended)".to_string(),
+        "sqlite3 (Recommended)".to_string(),
         "bind".to_string(),
         "gmysql".to_string(),
         "gpgsql".to_string(),
@@ -1747,7 +1830,7 @@ fn prompt_powerdns_backend_package() -> AppResult<String> {
     let index = prompt_select("Choose a PowerDNS backend package", &labels)?;
 
     Ok(match index {
-        0 => "pdns-backend-gsqlite3".to_string(),
+        0 => "pdns-backend-sqlite3".to_string(),
         1 => "pdns-backend-bind".to_string(),
         2 => "pdns-backend-gmysql".to_string(),
         3 => "pdns-backend-gpgsql".to_string(),
@@ -1854,6 +1937,22 @@ fn compare_numeric_versions(left: &str, right: &str) -> std::cmp::Ordering {
     }
 
     std::cmp::Ordering::Equal
+}
+
+fn powerdns_update_available(installed: &str, candidate: &str) -> bool {
+    if installed == candidate {
+        return false;
+    }
+
+    if command_exists("dpkg") {
+        return Command::new("dpkg")
+            .args(["--compare-versions", candidate, "gt", installed])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or_else(|_| compare_numeric_versions(candidate, installed).is_gt());
+    }
+
+    compare_numeric_versions(candidate, installed).is_gt()
 }
 
 fn parse_numeric_version_parts(value: &str) -> Vec<u32> {
@@ -2248,6 +2347,58 @@ fn format_record_label(record: &ZoneRecord) -> String {
     )
 }
 
+fn format_record_value_label(record: &ZoneRecord) -> String {
+    format!(
+        "{:<5}  {:<6}  {}",
+        record.record_type,
+        record
+            .ttl
+            .map(|ttl| ttl.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        record.content
+    )
+}
+
+fn collect_unique_name_options(records: &[ZoneRecord]) -> Vec<(String, usize)> {
+    let mut options: Vec<(String, usize)> = Vec::new();
+
+    for record in records {
+        if let Some((_, count)) = options.iter_mut().find(|(name, _)| *name == record.name) {
+            *count += 1;
+        } else {
+            options.push((record.name.clone(), 1));
+        }
+    }
+
+    options.sort_by(|left, right| left.0.cmp(&right.0));
+    options
+}
+
+fn collect_unique_type_options(records: &[ZoneRecord]) -> Vec<(String, usize)> {
+    let mut options: Vec<(String, usize)> = Vec::new();
+
+    for record in records {
+        if let Some((_, count)) = options
+            .iter_mut()
+            .find(|(record_type, _)| *record_type == record.record_type)
+        {
+            *count += 1;
+        } else {
+            options.push((record.record_type.clone(), 1));
+        }
+    }
+
+    options.sort_by(|left, right| left.0.cmp(&right.0));
+    options
+}
+
+fn is_sensitive_delete(spec: &DeleteRecordSpec) -> bool {
+    matches!(
+        spec.record_type.as_str(),
+        "SOA" | "DNSKEY" | "RRSIG" | "NSEC" | "NSEC3"
+    ) || spec.record_type == "NS"
+}
+
 fn expect_value(cursor: &mut ArgCursor, flag: &str) -> AppResult<String> {
     cursor
         .next()
@@ -2451,10 +2602,77 @@ mod tests {
     }
 
     #[test]
+    fn legacy_increase_serial_uses_old_pdnsutil_form() {
+        let runner = PdnsUtil {
+            global: GlobalOptions::default(),
+            syntax: PdnsSyntax::Legacy,
+        };
+
+        assert_eq!(
+            runner.increase_serial_args("example.com."),
+            vec!["increase-serial".to_string(), "example.com.".to_string()]
+        );
+    }
+
+    #[test]
+    fn modern_increase_serial_uses_new_pdnsutil_form() {
+        let runner = PdnsUtil {
+            global: GlobalOptions::default(),
+            syntax: PdnsSyntax::Modern,
+        };
+
+        assert_eq!(
+            runner.increase_serial_args("example.com."),
+            vec![
+                "zone".to_string(),
+                "increase-serial".to_string(),
+                "example.com.".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn version_comparison_detects_newer_patch_release() {
         assert!(compare_numeric_versions("1.0.2", "1.0.1").is_gt());
         assert!(compare_numeric_versions("1.0.1", "1.0.1").is_eq());
         assert!(compare_numeric_versions("1.0.0", "1.0.1").is_lt());
+    }
+
+    #[test]
+    fn powerdns_update_detection_handles_same_debian_package_version() {
+        assert!(!powerdns_update_available("4.8.3-4build3", "4.8.3-4build3"));
+    }
+
+    #[test]
+    fn collect_unique_name_options_groups_records() {
+        let records = vec![
+            ZoneRecord {
+                name: "a.example.com.".to_string(),
+                ttl: Some(300),
+                record_type: "A".to_string(),
+                content: "1.1.1.1".to_string(),
+            },
+            ZoneRecord {
+                name: "a.example.com.".to_string(),
+                ttl: Some(300),
+                record_type: "TXT".to_string(),
+                content: "\"x\"".to_string(),
+            },
+            ZoneRecord {
+                name: "b.example.com.".to_string(),
+                ttl: Some(300),
+                record_type: "A".to_string(),
+                content: "2.2.2.2".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            collect_unique_name_options(&records),
+            vec![
+                ("a.example.com.".to_string(), 2),
+                ("b.example.com.".to_string(), 1)
+            ]
+        );
     }
 
     #[test]
@@ -2478,5 +2696,26 @@ mod tests {
         assert!(labels.contains(&"Reinstall PowerDNS".to_string()));
         assert!(labels.contains(&"Update ppdns".to_string()));
         assert!(labels.contains(&"Reinstall ppdns".to_string()));
+    }
+
+    #[test]
+    fn home_actions_hide_powerdns_update_when_candidate_is_same() {
+        let status = HomeStatus {
+            powerdns: PowerDnsStatus::Installed {
+                installed: "4.8.3-4build3".to_string(),
+                candidate: Some("4.8.3-4build3".to_string()),
+            },
+            ppdns: SelfStatus::LatestKnown {
+                current: "1.0.1".to_string(),
+                latest: "1.0.1".to_string(),
+                update_available: false,
+            },
+        };
+
+        let actions = build_home_actions(&status);
+        let labels: Vec<String> = actions.into_iter().map(|(label, _)| label).collect();
+
+        assert!(!labels.contains(&"Update PowerDNS".to_string()));
+        assert!(labels.contains(&"Reinstall PowerDNS".to_string()));
     }
 }
