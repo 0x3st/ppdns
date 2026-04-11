@@ -1,0 +1,87 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "${VERSION}" != "${TAG_VERSION}" ]; then
+            echo "Tag version ${TAG_VERSION} does not match Cargo.toml version ${VERSION}" >&2
+            exit 1
+          fi
+
+      - name: Verify changelog entry for release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: bash scripts/check-changelog.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Build release binary
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+
+      - name: Package release archive
+        run: SKIP_BUILD=1 bash scripts/package-release.sh ${{ matrix.target }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect release files
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.sha256' \) -exec cp {} release/ \;
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
