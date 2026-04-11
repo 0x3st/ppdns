@@ -1,5 +1,5 @@
 use std::io::{self, Stdout};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -66,13 +66,15 @@ impl Drop for TerminalSession {
 
 struct DnsPanel {
     global: GlobalOptions,
-    status: HomeStatus,
     runner: Option<PdnsUtil>,
     backend_error: Option<String>,
     zones: Vec<String>,
     zone_state: ListState,
     records: Vec<ZoneRecord>,
+    filtered_records: Vec<usize>,
     record_state: TableState,
+    records_loading: bool,
+    pending_zone_reload: Option<PendingZoneReload>,
     filter: String,
     focus: Focus,
     mode: Mode,
@@ -117,6 +119,10 @@ struct DeleteDialog {
     warning: bool,
 }
 
+struct PendingZoneReload {
+    ready_at: Instant,
+}
+
 struct FlashMessage {
     kind: FlashKind,
     text: String,
@@ -140,13 +146,15 @@ impl DnsPanel {
 
         Self {
             global,
-            status: gather_home_status(),
             runner: None,
             backend_error: None,
             zones: Vec::new(),
             zone_state,
             records: Vec::new(),
+            filtered_records: Vec::new(),
             record_state,
+            records_loading: false,
+            pending_zone_reload: None,
             filter: String::new(),
             focus: Focus::Zones,
             mode: Mode::Browse,
@@ -155,22 +163,63 @@ impl DnsPanel {
     }
 
     fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> AppResult<()> {
-        loop {
-            terminal.draw(|frame| self.draw(frame))?;
+        let mut needs_draw = true;
 
-            if !event::poll(Duration::from_millis(200))? {
-                continue;
+        loop {
+            if needs_draw {
+                terminal.draw(|frame| self.draw(frame))?;
+                needs_draw = false;
             }
 
-            match event::read()? {
+            if let Some(timeout) = self.pending_zone_reload_timeout() {
+                if !event::poll(timeout)? {
+                    self.flush_pending_zone_reload();
+                    needs_draw = true;
+                    continue;
+                }
+            }
+
+            let next_event = event::read()?;
+
+            match next_event {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if self.handle_key(key)? {
                         return Ok(());
                     }
+                    needs_draw = true;
                 }
-                Event::Paste(text) => self.handle_paste(&text),
+                Event::Paste(text) => {
+                    self.handle_paste(&text);
+                    needs_draw = true;
+                }
+                Event::Resize(_, _) => {
+                    needs_draw = true;
+                }
                 _ => {}
             }
+        }
+    }
+
+    fn pending_zone_reload_timeout(&self) -> Option<Duration> {
+        self.pending_zone_reload
+            .as_ref()
+            .map(|pending| pending.ready_at.saturating_duration_since(Instant::now()))
+    }
+
+    fn schedule_record_reload(&mut self) {
+        self.pending_zone_reload = self.selected_zone().map(|_| PendingZoneReload {
+            ready_at: Instant::now() + Duration::from_millis(120),
+        });
+
+        self.records_loading = self.pending_zone_reload.is_some();
+        self.records.clear();
+        self.rebuild_filtered_records();
+        self.record_state.select(None);
+    }
+
+    fn flush_pending_zone_reload(&mut self) {
+        if self.pending_zone_reload.take().is_some() {
+            self.reload_records();
         }
     }
 
@@ -178,7 +227,7 @@ impl DnsPanel {
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(4),
+                Constraint::Length(3),
                 Constraint::Min(12),
                 Constraint::Length(3),
             ])
@@ -198,48 +247,40 @@ impl DnsPanel {
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
         let zone = self.selected_zone().unwrap_or("No zone selected");
-        let header = Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    "ppdns DNS panel",
-                    Style::default().fg(BRAND).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(
-                    "Cloudflare-style terminal workflow",
-                    Style::default().fg(MUTED),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Zone ", Style::default().fg(MUTED)),
-                Span::styled(zone, Style::default().fg(Color::White)),
-                Span::raw("   "),
-                Span::styled("Filter ", Style::default().fg(MUTED)),
-                Span::styled(
-                    if self.filter.is_empty() {
-                        "(none)"
-                    } else {
-                        self.filter.as_str()
-                    },
-                    Style::default().fg(Color::White),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    summarize_powerdns_status(&self.status.powerdns),
-                    Style::default().fg(MUTED),
-                ),
-                Span::raw("   "),
-                Span::styled(
-                    summarize_self_status(&self.status.ppdns),
-                    Style::default().fg(MUTED),
-                ),
-            ]),
-        ])
+        let header = Paragraph::new(Line::from(vec![
+            Span::styled(
+                "ppdns",
+                Style::default().fg(BRAND).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled("zone:", Style::default().fg(MUTED)),
+            Span::raw(" "),
+            Span::styled(zone, Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled("filter:", Style::default().fg(MUTED)),
+            Span::raw(" "),
+            Span::styled(
+                if self.filter.is_empty() {
+                    "-"
+                } else {
+                    self.filter.as_str()
+                },
+                Style::default().fg(Color::White),
+            ),
+            Span::raw(if self.records_loading {
+                "  loading"
+            } else {
+                ""
+            }),
+            Span::styled(
+                if self.global.dry_run { "  dry-run" } else { "" },
+                Style::default().fg(WARNING),
+            ),
+        ]))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(BorderType::Plain)
                 .border_style(Style::default().fg(BRAND))
                 .style(Style::default().bg(PANEL_BG)),
         );
@@ -250,16 +291,11 @@ impl DnsPanel {
     fn render_body(&mut self, frame: &mut Frame, area: Rect) {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(28),
-                Constraint::Min(60),
-                Constraint::Length(40),
-            ])
+            .constraints([Constraint::Length(24), Constraint::Min(40)])
             .split(area);
 
         self.render_zone_list(frame, columns[0]);
         self.render_records_table(frame, columns[1]);
-        self.render_sidebar(frame, columns[2]);
     }
 
     fn render_zone_list(&mut self, frame: &mut Frame, area: Rect) {
@@ -287,20 +323,26 @@ impl DnsPanel {
                     .bg(BRAND)
                     .add_modifier(Modifier::BOLD),
             )
-            .highlight_symbol("▌ ");
+            .highlight_symbol("> ");
 
         frame.render_stateful_widget(list, area, &mut self.zone_state);
     }
 
     fn render_records_table(&mut self, frame: &mut Frame, area: Rect) {
-        let filtered = self.filtered_record_indices();
         let title = if self.filter.is_empty() {
-            format!(" DNS Records ({}) ", filtered.len())
+            format!(" DNS Records ({}) ", self.filtered_records.len())
         } else {
-            format!(" DNS Records ({}) / filtered ", filtered.len())
+            format!(" DNS Records ({}) / filtered ", self.filtered_records.len())
         };
 
-        let rows: Vec<Row> = if filtered.is_empty() {
+        let rows: Vec<Row> = if self.records_loading {
+            vec![Row::new(vec![
+                Cell::from("Loading records..."),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+            ])]
+        } else if self.filtered_records.is_empty() {
             vec![Row::new(vec![
                 Cell::from("No matching records"),
                 Cell::from(""),
@@ -308,7 +350,7 @@ impl DnsPanel {
                 Cell::from(""),
             ])]
         } else {
-            filtered
+            self.filtered_records
                 .iter()
                 .filter_map(|index| self.records.get(*index))
                 .map(|record| {
@@ -349,149 +391,9 @@ impl DnsPanel {
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             )
-            .highlight_symbol("▶ ");
+            .highlight_symbol("> ");
 
         frame.render_stateful_widget(table, area, &mut self.record_state);
-    }
-
-    fn render_sidebar(&self, frame: &mut Frame, area: Rect) {
-        let blocks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(8),
-                Constraint::Min(10),
-                Constraint::Length(8),
-            ])
-            .split(area);
-
-        let system = Paragraph::new(vec![
-            Line::from(Span::styled(
-                summarize_powerdns_status(&self.status.powerdns),
-                Style::default().fg(Color::White),
-            )),
-            Line::from(Span::styled(
-                summarize_self_status(&self.status.ppdns),
-                Style::default().fg(Color::White),
-            )),
-            Line::from(Span::styled(
-                format!("pdnsutil: {}", self.global.pdnsutil_bin),
-                Style::default().fg(MUTED),
-            )),
-            Line::from(Span::styled(
-                if self.global.dry_run {
-                    "mode: dry run"
-                } else {
-                    "mode: live changes"
-                },
-                Style::default().fg(if self.global.dry_run {
-                    WARNING
-                } else {
-                    SUCCESS
-                }),
-            )),
-        ])
-        .wrap(Wrap { trim: true })
-        .block(self.panel_block(" System ", false));
-        frame.render_widget(system, blocks[0]);
-
-        let details = if let Some(record) = self.selected_record() {
-            let zone = self.selected_zone().unwrap_or_default().to_string();
-            vec![
-                Line::from(vec![
-                    Span::styled("Zone ", Style::default().fg(MUTED)),
-                    Span::styled(zone, Style::default().fg(Color::White)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Name ", Style::default().fg(MUTED)),
-                    Span::styled(record.name.clone(), Style::default().fg(Color::White)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Type ", Style::default().fg(MUTED)),
-                    Span::styled(record.record_type.clone(), Style::default().fg(BRAND)),
-                ]),
-                Line::from(vec![
-                    Span::styled("TTL  ", Style::default().fg(MUTED)),
-                    Span::styled(
-                        record
-                            .ttl
-                            .map(|ttl| ttl.to_string())
-                            .unwrap_or_else(|| "<default>".to_string()),
-                        Style::default().fg(Color::White),
-                    ),
-                ]),
-                Line::from(Span::styled("Content", Style::default().fg(MUTED))),
-                Line::from(Span::styled(
-                    record.content.clone(),
-                    Style::default().fg(Color::White),
-                )),
-            ]
-        } else if let Some(zone) = self.selected_zone() {
-            vec![
-                Line::from(vec![
-                    Span::styled("Zone ", Style::default().fg(MUTED)),
-                    Span::styled(zone, Style::default().fg(Color::White)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Records ", Style::default().fg(MUTED)),
-                    Span::styled(
-                        self.records.len().to_string(),
-                        Style::default().fg(Color::White),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("Filtered ", Style::default().fg(MUTED)),
-                    Span::styled(
-                        self.filtered_record_indices().len().to_string(),
-                        Style::default().fg(Color::White),
-                    ),
-                ]),
-                Line::from(Span::styled(
-                    "Select a record to inspect its full value.",
-                    Style::default().fg(MUTED),
-                )),
-            ]
-        } else {
-            vec![Line::from(Span::styled(
-                "Load PowerDNS zones to begin.",
-                Style::default().fg(MUTED),
-            ))]
-        };
-
-        let details = Paragraph::new(details)
-            .wrap(Wrap { trim: true })
-            .block(self.panel_block(" Details ", false));
-        frame.render_widget(details, blocks[1]);
-
-        let mut shortcuts = vec![
-            Line::from(Span::styled(
-                "Tab switch pane   / filter",
-                Style::default().fg(Color::White),
-            )),
-            Line::from(Span::styled(
-                "a add record      d delete",
-                Style::default().fg(Color::White),
-            )),
-            Line::from(Span::styled(
-                "r refresh         c clear filter",
-                Style::default().fg(Color::White),
-            )),
-            Line::from(Span::styled(
-                "q quit            ppdns install",
-                Style::default().fg(Color::White),
-            )),
-        ];
-
-        if let Some(error) = &self.backend_error {
-            shortcuts.push(Line::from(Span::styled(
-                error.clone(),
-                Style::default().fg(ERROR),
-            )));
-        }
-
-        let shortcuts = Paragraph::new(shortcuts)
-            .wrap(Wrap { trim: true })
-            .block(self.panel_block(" Actions ", false));
-        frame.render_widget(shortcuts, blocks[2]);
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
@@ -499,7 +401,7 @@ impl DnsPanel {
             Some(message) => (message.kind, message.text.as_str()),
             None => (
                 FlashKind::Info,
-                "Arrow keys move. Enter the TUI with `ppdns`. Use `ppdns install` for PowerDNS or self upgrades.",
+                "j/k move  tab switch  / filter  a add  d delete  r refresh  q quit",
             ),
         };
 
@@ -516,6 +418,7 @@ impl DnsPanel {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_type(BorderType::Plain)
                     .border_style(Style::default().fg(BORDER))
                     .style(Style::default().bg(PANEL_ALT_BG)),
             )
@@ -573,7 +476,7 @@ impl DnsPanel {
                 Span::styled(zone, Style::default().fg(Color::White)),
             ]),
             Line::from(Span::styled(
-                "Examples: A/AAAA use raw IP, TXT can be plain text, MX uses `10 mail.example.com.`",
+                "Leave name empty for @.",
                 Style::default().fg(MUTED),
             )),
             Line::from(""),
@@ -644,7 +547,7 @@ impl DnsPanel {
         if dialog.warning {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "Warning: this is a sensitive record type. Double-check before confirming.",
+                "Sensitive record type. Confirm carefully.",
                 Style::default().fg(WARNING),
             )));
         }
@@ -696,6 +599,12 @@ impl DnsPanel {
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => Ok(true),
+            KeyCode::Enter => {
+                if self.pending_zone_reload.is_some() {
+                    self.flush_pending_zone_reload();
+                }
+                Ok(false)
+            }
             KeyCode::Tab | KeyCode::Right | KeyCode::Left => {
                 self.toggle_focus();
                 Ok(false)
@@ -716,6 +625,7 @@ impl DnsPanel {
             }
             KeyCode::Char('c') => {
                 self.filter.clear();
+                self.rebuild_filtered_records();
                 self.ensure_record_selection();
                 self.message = Some(FlashMessage::info("record filter cleared"));
                 Ok(false)
@@ -734,7 +644,11 @@ impl DnsPanel {
                 Ok(false)
             }
             KeyCode::Char('d') => {
-                if let Some(record) = self.selected_record() {
+                if self.records_loading {
+                    self.message = Some(FlashMessage::warning(
+                        "wait for zone records to finish loading before deleting",
+                    ));
+                } else if let Some(record) = self.selected_record() {
                     let spec = DeleteRecordSpec {
                         zone: self.selected_zone().unwrap_or_default().to_string(),
                         name: record.name.clone(),
@@ -757,6 +671,7 @@ impl DnsPanel {
             KeyCode::Esc => false,
             KeyCode::Enter => {
                 self.filter = state.value.trim().to_string();
+                self.rebuild_filtered_records();
                 self.ensure_record_selection();
                 self.message = Some(FlashMessage::info(if self.filter.is_empty() {
                     "showing all records"
@@ -824,7 +739,8 @@ impl DnsPanel {
     }
 
     fn refresh_all(&mut self) {
-        self.status = gather_home_status();
+        self.pending_zone_reload = None;
+        self.records_loading = false;
         self.runner = match PdnsUtil::new(self.global.clone()) {
             Ok(runner) => {
                 self.backend_error = None;
@@ -834,6 +750,7 @@ impl DnsPanel {
                 self.backend_error = Some(err.to_string());
                 self.zones.clear();
                 self.records.clear();
+                self.rebuild_filtered_records();
                 self.zone_state.select(None);
                 self.record_state.select(None);
                 self.message = Some(FlashMessage::error(
@@ -850,6 +767,7 @@ impl DnsPanel {
         let previous_zone = self.selected_zone().map(ToOwned::to_owned);
         let Some(runner) = self.runner.as_ref() else {
             self.records.clear();
+            self.rebuild_filtered_records();
             return;
         };
 
@@ -862,11 +780,13 @@ impl DnsPanel {
                     .or_else(|| (!self.zones.is_empty()).then_some(0));
 
                 self.zone_state.select(selected);
+                self.pending_zone_reload = None;
                 self.reload_records();
             }
             Err(err) => {
                 self.zones.clear();
                 self.records.clear();
+                self.rebuild_filtered_records();
                 self.zone_state.select(None);
                 self.record_state.select(None);
                 self.message = Some(FlashMessage::error(err.to_string()));
@@ -875,14 +795,19 @@ impl DnsPanel {
     }
 
     fn reload_records(&mut self) {
+        self.pending_zone_reload = None;
         let Some(zone) = self.selected_zone().map(ToOwned::to_owned) else {
             self.records.clear();
+            self.rebuild_filtered_records();
+            self.records_loading = false;
             self.record_state.select(None);
             return;
         };
 
         let Some(runner) = self.runner.as_ref() else {
             self.records.clear();
+            self.rebuild_filtered_records();
+            self.records_loading = false;
             self.record_state.select(None);
             return;
         };
@@ -890,10 +815,14 @@ impl DnsPanel {
         match runner.list_zone_records(&zone) {
             Ok(records) => {
                 self.records = records;
+                self.records_loading = false;
+                self.rebuild_filtered_records();
                 self.ensure_record_selection();
             }
             Err(err) => {
                 self.records.clear();
+                self.rebuild_filtered_records();
+                self.records_loading = false;
                 self.record_state.select(None);
                 self.message = Some(FlashMessage::error(err.to_string()));
             }
@@ -916,19 +845,18 @@ impl DnsPanel {
         let next = clamp_offset(current, self.zones.len(), delta);
         if next != current {
             self.zone_state.select(Some(next));
-            self.reload_records();
+            self.schedule_record_reload();
         }
     }
 
     fn move_record_selection(&mut self, delta: isize) {
-        let filtered = self.filtered_record_indices();
-        if filtered.is_empty() {
+        if self.records_loading || self.filtered_records.is_empty() {
             self.record_state.select(None);
             return;
         }
 
         let current = self.record_state.selected().unwrap_or(0);
-        let next = clamp_offset(current, filtered.len(), delta);
+        let next = clamp_offset(current, self.filtered_records.len(), delta);
         self.record_state.select(Some(next));
     }
 
@@ -937,10 +865,14 @@ impl DnsPanel {
             Focus::Zones => Focus::Records,
             Focus::Records => Focus::Zones,
         };
+
+        if self.focus == Focus::Records && self.pending_zone_reload.is_some() {
+            self.flush_pending_zone_reload();
+        }
     }
 
     fn ensure_record_selection(&mut self) {
-        let filtered_len = self.filtered_record_indices().len();
+        let filtered_len = self.filtered_records.len();
         if filtered_len == 0 {
             self.record_state.select(None);
         } else {
@@ -953,9 +885,10 @@ impl DnsPanel {
         }
     }
 
-    fn filtered_record_indices(&self) -> Vec<usize> {
+    fn rebuild_filtered_records(&mut self) {
         let filter = self.filter.trim().to_ascii_lowercase();
-        self.records
+        self.filtered_records = self
+            .records
             .iter()
             .enumerate()
             .filter(|(_, record)| {
@@ -975,7 +908,7 @@ impl DnsPanel {
                 haystack.contains(&filter)
             })
             .map(|(index, _)| index)
-            .collect()
+            .collect();
     }
 
     fn selected_zone(&self) -> Option<&str> {
@@ -986,9 +919,12 @@ impl DnsPanel {
     }
 
     fn selected_record(&self) -> Option<&ZoneRecord> {
-        let filtered = self.filtered_record_indices();
+        if self.records_loading {
+            return None;
+        }
+
         let visible_index = self.record_state.selected()?;
-        let record_index = *filtered.get(visible_index)?;
+        let record_index = *self.filtered_records.get(visible_index)?;
         self.records.get(record_index)
     }
 
@@ -1123,7 +1059,7 @@ impl DnsPanel {
         Block::default()
             .title(title.to_string())
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(BorderType::Plain)
             .border_style(Style::default().fg(if focused { BRAND } else { BORDER }))
             .style(Style::default().bg(PANEL_BG))
     }
@@ -1132,7 +1068,7 @@ impl DnsPanel {
         Block::default()
             .title(title.to_string())
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(BorderType::Plain)
             .border_style(Style::default().fg(BRAND_DIM))
             .style(Style::default().bg(PANEL_ALT_BG))
     }

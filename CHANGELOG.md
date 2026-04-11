@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0-alpha.2] - 2026-04-11
+
+### Changed
+
+- Simplified the default TUI to a leaner two-pane layout with fewer decorative elements and less persistent status text.
+- Removed startup PowerDNS and latest-release status checks from the TUI path so the panel opens with less overhead on smaller machines.
+- Reduced record-table work by caching filtered rows and debouncing zone reloads while moving through the zone list.
+
+### Fixed
+
+- Improved TUI responsiveness when navigating zones and large record sets.
+- Prevented delete actions from using stale selections while the next zone is still loading.
+
 ## [1.1.0-alpha.1] - 2026-04-11
 
 ### Added
