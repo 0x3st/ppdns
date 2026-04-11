@@ -492,7 +492,7 @@ impl PdnsUtil {
             PdnsSyntax::Legacy => vec![
                 "add-record".to_string(),
                 spec.zone.clone(),
-                spec.name.clone(),
+                legacy_owner_name_arg(&spec.zone, &spec.name),
                 spec.record_type.clone(),
             ],
         };
@@ -528,7 +528,7 @@ impl PdnsUtil {
             (PdnsSyntax::Legacy, DeleteMethod::DeleteRrset) => vec![
                 "delete-rrset".to_string(),
                 plan.zone.clone(),
-                plan.name.clone(),
+                legacy_owner_name_arg(&plan.zone, &plan.name),
                 plan.record_type.clone(),
             ],
             (
@@ -563,7 +563,7 @@ impl PdnsUtil {
                 let mut args = vec![
                     "replace-rrset".to_string(),
                     plan.zone.clone(),
-                    plan.name.clone(),
+                    legacy_owner_name_arg(&plan.zone, &plan.name),
                     plan.record_type.clone(),
                 ];
 
@@ -1059,6 +1059,27 @@ fn delete_plan_matches_records(
 
             actual_contents == expected_contents
         }
+    }
+}
+
+fn legacy_owner_name_arg(zone: &str, name: &str) -> String {
+    if name.eq_ignore_ascii_case(zone) {
+        return "@".to_string();
+    }
+
+    let name_lower = name.to_ascii_lowercase();
+    let zone_lower = zone.to_ascii_lowercase();
+
+    if name_lower.ends_with(&zone_lower) {
+        let prefix = &name[..name.len().saturating_sub(zone.len())];
+        let trimmed = prefix.trim_end_matches('.');
+        if trimmed.is_empty() {
+            "@".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        name.trim_end_matches('.').to_string()
     }
 }
 
@@ -2880,7 +2901,7 @@ mod tests {
             vec![
                 "add-record".to_string(),
                 "example.com.".to_string(),
-                "www.example.com.".to_string(),
+                "www".to_string(),
                 "A".to_string(),
                 "300".to_string(),
                 "1.2.3.4".to_string()
@@ -2909,12 +2930,41 @@ mod tests {
             vec![
                 "replace-rrset".to_string(),
                 "example.com.".to_string(),
-                "www.example.com.".to_string(),
+                "www".to_string(),
                 "A".to_string(),
                 "300".to_string(),
                 "5.6.7.8".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn legacy_delete_rrset_uses_relative_owner_name() {
+        let runner = PdnsUtil {
+            global: GlobalOptions::default(),
+            syntax: PdnsSyntax::Legacy,
+        };
+        let plan = DeletePlan {
+            zone: "234234.xyz.".to_string(),
+            name: "234-ussanjose-20260408._domainkey.234234.xyz.".to_string(),
+            record_type: "CNAME".to_string(),
+            method: DeleteMethod::DeleteRrset,
+        };
+
+        assert_eq!(
+            runner.delete_plan_args(&plan),
+            vec![
+                "delete-rrset".to_string(),
+                "234234.xyz.".to_string(),
+                "234-ussanjose-20260408._domainkey".to_string(),
+                "CNAME".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_owner_name_uses_apex_marker_for_zone_root() {
+        assert_eq!(legacy_owner_name_arg("example.com.", "example.com."), "@");
     }
 
     #[test]

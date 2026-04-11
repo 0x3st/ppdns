@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0-alpha.6] - 2026-04-12
+
+### Fixed
+
+- Corrected legacy PowerDNS `pdnsutil` owner-name arguments for `add-record`, `delete-rrset`, and `replace-rrset`, so PowerDNS `4.8.x` receives relative owner names instead of absolute names.
+- Fixed legacy delete operations that could return success while leaving the target rrset untouched, especially for records such as DKIM `CNAME` entries under `_domainkey`.
+
 ## [1.1.0-alpha.5] - 2026-04-12
 
 ### Fixed
