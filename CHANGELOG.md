@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0-alpha.5] - 2026-04-12
+
+### Fixed
+
+- Verified add and delete mutations by reloading the zone after `pdnsutil` returns, and now show an explicit error when PowerDNS reports success but the record state does not actually change.
+- Updated the TUI mutation path to refresh from the verified zone state instead of optimistic local edits, so stale records do not silently reappear as a false success.
+- Defaulted the initial TUI focus to the records pane so record browsing works immediately after launch.
+
 ## [1.1.0-alpha.4] - 2026-04-12
 
 ### Fixed

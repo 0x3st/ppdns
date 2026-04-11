@@ -876,6 +876,7 @@ fn execute_add_record(runner: &PdnsUtil, args: AddRecordArgs) -> AppResult<()> {
     }
 
     runner.add_record(&spec)?;
+    verify_add_record_applied(runner, &spec)?;
     println!("Record added.");
     handle_serial_bump_result(runner, &spec.zone, "add")?;
     Ok(())
@@ -924,6 +925,7 @@ fn execute_delete_record(runner: &PdnsUtil, args: DeleteRecordArgs) -> AppResult
     }
 
     runner.apply_delete_plan(&plan)?;
+    verify_delete_record_applied(runner, &spec, &plan)?;
     println!("Record deleted.");
     handle_serial_bump_result(runner, &spec.zone, "delete")?;
     Ok(())
@@ -963,6 +965,114 @@ fn handle_serial_bump_result(runner: &PdnsUtil, zone: &str, operation: &str) -> 
             Ok(())
         }
     }
+}
+
+fn verify_add_record_applied(
+    runner: &PdnsUtil,
+    spec: &AddRecordSpec,
+) -> AppResult<Vec<ZoneRecord>> {
+    let records = runner.list_zone_records(&spec.zone)?;
+    let applied = add_record_exists(&records, spec);
+
+    if applied {
+        Ok(records)
+    } else {
+        Err(AppError::Message(build_mutation_state_error(
+            runner,
+            format!(
+                "add command finished, but `{}` `{}` `{}` is still missing after reload",
+                spec.name, spec.record_type, spec.content
+            ),
+        )))
+    }
+}
+
+fn verify_delete_record_applied(
+    runner: &PdnsUtil,
+    spec: &DeleteRecordSpec,
+    plan: &DeletePlan,
+) -> AppResult<Vec<ZoneRecord>> {
+    let records = runner.list_zone_records(&spec.zone)?;
+    let delete_applied = delete_plan_matches_records(&records, spec, plan);
+
+    if delete_applied {
+        Ok(records)
+    } else {
+        let detail = match &plan.method {
+            DeleteMethod::DeleteRrset => format!(
+                "delete command finished, but rrset `{}` `{}` is still present after reload",
+                spec.name, spec.record_type
+            ),
+            DeleteMethod::Replace { .. } => format!(
+                "delete command finished, but rrset `{}` `{}` still has unexpected values after reload",
+                spec.name, spec.record_type
+            ),
+        };
+
+        Err(AppError::Message(build_mutation_state_error(
+            runner, detail,
+        )))
+    }
+}
+
+fn build_mutation_state_error(runner: &PdnsUtil, detail: String) -> String {
+    let suffix = match runner.syntax {
+        PdnsSyntax::Legacy => {
+            " PowerDNS may have accepted the command without applying it; check pdnsutil 4.x compatibility."
+        }
+        PdnsSyntax::Modern => {
+            " PowerDNS reported success, but the zone state did not change."
+        }
+    };
+
+    format!("{detail}.{suffix}")
+}
+
+fn add_record_exists(records: &[ZoneRecord], spec: &AddRecordSpec) -> bool {
+    records.iter().any(|record| {
+        record.name == spec.name
+            && record.record_type.eq_ignore_ascii_case(&spec.record_type)
+            && record.content == spec.content
+    })
+}
+
+fn delete_plan_matches_records(
+    records: &[ZoneRecord],
+    spec: &DeleteRecordSpec,
+    plan: &DeletePlan,
+) -> bool {
+    let rrset_records = records_for_rrset(records, &spec.name, &spec.record_type);
+
+    match &plan.method {
+        DeleteMethod::DeleteRrset => rrset_records.is_empty(),
+        DeleteMethod::Replace {
+            remaining_contents, ..
+        } => {
+            let mut expected_contents = remaining_contents.clone();
+            expected_contents.sort();
+
+            let mut actual_contents = rrset_records
+                .iter()
+                .map(|record| record.content.clone())
+                .collect::<Vec<_>>();
+            actual_contents.sort();
+
+            actual_contents == expected_contents
+        }
+    }
+}
+
+fn records_for_rrset<'a>(
+    records: &'a [ZoneRecord],
+    name: &str,
+    record_type: &str,
+) -> Vec<&'a ZoneRecord> {
+    records
+        .iter()
+        .filter(|record| {
+            record.name == name && record.record_type.eq_ignore_ascii_case(record_type)
+        })
+        .collect()
 }
 
 fn gather_home_status() -> HomeStatus {
@@ -2651,6 +2761,92 @@ mod tests {
             build_delete_plan("example.com.", &records, &spec).expect("delete plan should build");
 
         assert!(matches!(plan.method, DeleteMethod::DeleteRrset));
+    }
+
+    #[test]
+    fn add_record_verification_detects_expected_record() {
+        let spec = AddRecordSpec {
+            zone: "example.com.".to_string(),
+            name: "www.example.com.".to_string(),
+            record_type: "A".to_string(),
+            content: "1.2.3.4".to_string(),
+            ttl: Some(300),
+        };
+        let records = vec![ZoneRecord {
+            name: "www.example.com.".to_string(),
+            ttl: Some(300),
+            record_type: "A".to_string(),
+            content: "1.2.3.4".to_string(),
+        }];
+
+        assert!(add_record_exists(&records, &spec));
+    }
+
+    #[test]
+    fn delete_verification_requires_rrset_to_disappear() {
+        let spec = DeleteRecordSpec {
+            zone: "example.com.".to_string(),
+            name: "www.example.com.".to_string(),
+            record_type: "A".to_string(),
+            content: "1.1.1.1".to_string(),
+        };
+        let plan = DeletePlan {
+            zone: "example.com.".to_string(),
+            name: "www.example.com.".to_string(),
+            record_type: "A".to_string(),
+            method: DeleteMethod::DeleteRrset,
+        };
+        let records = vec![ZoneRecord {
+            name: "www.example.com.".to_string(),
+            ttl: Some(300),
+            record_type: "A".to_string(),
+            content: "1.1.1.1".to_string(),
+        }];
+
+        assert!(!delete_plan_matches_records(&records, &spec, &plan));
+        assert!(delete_plan_matches_records(&[], &spec, &plan));
+    }
+
+    #[test]
+    fn delete_verification_checks_remaining_rrset_values() {
+        let spec = DeleteRecordSpec {
+            zone: "example.com.".to_string(),
+            name: "www.example.com.".to_string(),
+            record_type: "A".to_string(),
+            content: "1.1.1.1".to_string(),
+        };
+        let plan = DeletePlan {
+            zone: "example.com.".to_string(),
+            name: "www.example.com.".to_string(),
+            record_type: "A".to_string(),
+            method: DeleteMethod::Replace {
+                ttl: Some(300),
+                remaining_contents: vec!["2.2.2.2".to_string()],
+            },
+        };
+        let matching_records = vec![ZoneRecord {
+            name: "www.example.com.".to_string(),
+            ttl: Some(300),
+            record_type: "A".to_string(),
+            content: "2.2.2.2".to_string(),
+        }];
+        let stale_records = vec![
+            ZoneRecord {
+                name: "www.example.com.".to_string(),
+                ttl: Some(300),
+                record_type: "A".to_string(),
+                content: "1.1.1.1".to_string(),
+            },
+            ZoneRecord {
+                name: "www.example.com.".to_string(),
+                ttl: Some(300),
+                record_type: "A".to_string(),
+                content: "2.2.2.2".to_string(),
+            },
+        ];
+
+        assert!(delete_plan_matches_records(&matching_records, &spec, &plan));
+        assert!(!delete_plan_matches_records(&stale_records, &spec, &plan));
     }
 
     #[test]

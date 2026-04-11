@@ -152,12 +152,13 @@ enum BackgroundEvent {
 enum MutationResult {
     Add {
         spec: AddRecordSpec,
+        records: Vec<ZoneRecord>,
         output: Option<String>,
         serial_warning: Option<String>,
     },
     Delete {
         spec: DeleteRecordSpec,
-        plan: DeletePlan,
+        records: Vec<ZoneRecord>,
         output: Option<String>,
         serial_warning: Option<String>,
     },
@@ -197,7 +198,7 @@ impl DnsPanel {
             records_loading: false,
             pending_zone_reload: None,
             filter: String::new(),
-            focus: Focus::Zones,
+            focus: Focus::Records,
             mode: Mode::Browse,
             message: None,
         }
@@ -296,13 +297,6 @@ impl DnsPanel {
         }
     }
 
-    fn schedule_background_reload(&mut self, delay: Duration) {
-        self.pending_zone_reload = self.selected_zone().map(|_| PendingZoneReload {
-            ready_at: Instant::now() + delay,
-            clear_records: false,
-        });
-    }
-
     fn flush_pending_zone_reload(&mut self) {
         if let Some(pending) = self.pending_zone_reload.take() {
             self.reload_records(pending.clear_records);
@@ -355,12 +349,14 @@ impl DnsPanel {
                 match result {
                     Ok(MutationResult::Add {
                         spec,
+                        records,
                         output,
                         serial_warning,
                     }) => {
                         if self.selected_zone() == Some(zone.as_str()) {
-                            self.apply_add_locally(&spec);
-                            self.schedule_background_reload(Duration::from_millis(800));
+                            self.records = records;
+                            self.rebuild_filtered_records();
+                            self.ensure_record_selection();
                         }
 
                         self.message = Some(self.build_mutation_message(
@@ -374,13 +370,14 @@ impl DnsPanel {
                     }
                     Ok(MutationResult::Delete {
                         spec,
-                        plan,
+                        records,
                         output,
                         serial_warning,
                     }) => {
                         if self.selected_zone() == Some(zone.as_str()) {
-                            self.apply_delete_locally(&spec, &plan);
-                            self.schedule_background_reload(Duration::from_millis(800));
+                            self.records = records;
+                            self.rebuild_filtered_records();
+                            self.ensure_record_selection();
                         }
 
                         self.message = Some(self.build_mutation_message(
@@ -1196,8 +1193,10 @@ impl DnsPanel {
             let result = (|| {
                 let output = run_mutation_with_runner(&runner, &runner.add_record_args(&spec))?;
                 let serial_warning = bump_serial_with_runner(&zone, &runner);
+                let records = verify_add_record_applied(&runner, &spec)?;
                 Ok(MutationResult::Add {
                     spec,
+                    records,
                     output,
                     serial_warning,
                 })
@@ -1250,9 +1249,10 @@ impl DnsPanel {
             let result = (|| {
                 let output = run_mutation_with_runner(&runner, &runner.delete_plan_args(&plan))?;
                 let serial_warning = bump_serial_with_runner(&zone, &runner);
+                let records = verify_delete_record_applied(&runner, &spec, &plan)?;
                 Ok(MutationResult::Delete {
                     spec,
-                    plan,
+                    records,
                     output,
                     serial_warning,
                 })
@@ -1267,47 +1267,6 @@ impl DnsPanel {
 
         Ok(())
     }
-
-    fn apply_add_locally(&mut self, spec: &AddRecordSpec) {
-        self.records.push(ZoneRecord {
-            name: spec.name.clone(),
-            ttl: spec.ttl,
-            record_type: spec.record_type.clone(),
-            content: spec.content.clone(),
-        });
-        self.rebuild_filtered_records();
-        self.ensure_record_selection();
-    }
-
-    fn apply_delete_locally(&mut self, spec: &DeleteRecordSpec, plan: &DeletePlan) {
-        match &plan.method {
-            DeleteMethod::DeleteRrset => {
-                self.records.retain(|record| {
-                    !(record.name == spec.name
-                        && record.record_type.eq_ignore_ascii_case(&spec.record_type))
-                });
-            }
-            DeleteMethod::Replace { .. } => {
-                let mut removed = false;
-                self.records.retain(|record| {
-                    let matches = !removed
-                        && record.name == spec.name
-                        && record.record_type.eq_ignore_ascii_case(&spec.record_type)
-                        && record.content == spec.content;
-                    if matches {
-                        removed = true;
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
-        }
-
-        self.rebuild_filtered_records();
-        self.ensure_record_selection();
-    }
-
     fn panel_block(&self, title: &str, focused: bool) -> Block<'static> {
         Block::default()
             .title(title.to_string())
