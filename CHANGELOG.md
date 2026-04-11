@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0-alpha.1] - 2026-04-11
+
+### Added
+
+- Full-screen terminal DNS panel as the default `ppdns` experience, with zone navigation, record table, detail sidebar, inline filtering, add-record dialog, and delete confirmation.
+- New `ppdns install` command for guided PowerDNS package install/update/reinstall and `ppdns` self-update flows.
+- MIT license metadata and repository license file.
+
+### Changed
+
+- Default interactive entry now launches the TUI panel instead of the old menu-driven home screen.
+- Release workflow now marks tags with prerelease suffixes such as `-alpha.1` as GitHub prereleases automatically.
+
 ## [1.0.2] - 2026-04-11
 
 ### Added
