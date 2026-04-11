@@ -67,6 +67,7 @@ This repo includes:
 - [scripts/install.sh](/Users/laywoo/ppdns/scripts/install.sh) for end-user installation
 - [scripts/package-release.sh](/Users/laywoo/ppdns/scripts/package-release.sh) for creating release archives
 - [scripts/check-changelog.sh](/Users/laywoo/ppdns/scripts/check-changelog.sh) for validating release notes in `CHANGELOG.md`
+- [scripts/render-release-notes.sh](/Users/laywoo/ppdns/scripts/render-release-notes.sh) for extracting one version entry into the GitHub Release body
 - [.github/workflows/release.yml](/Users/laywoo/ppdns/.github/workflows/release.yml) for GitHub Release automation
 
 Package a local release artifact:
@@ -80,7 +81,7 @@ This creates:
 - `dist/ppdns-x86_64-unknown-linux-musl.tar.gz`
 - `dist/ppdns-x86_64-unknown-linux-musl.tar.gz.sha256`
 
-The GitHub Actions workflow is designed to build and publish Linux binaries on `v*` tags, with version checks against `Cargo.toml` and `CHANGELOG.md`. GitHub Release notes are also generated automatically from commits.
+The GitHub Actions workflow is designed to build and publish Linux binaries on `v*` tags, with version checks against `Cargo.toml` and `CHANGELOG.md`. The published Release body starts with the matching `CHANGELOG.md` section, and GitHub-generated release notes are appended after it.
 
 ## Quick Start
 

@@ -75,13 +75,20 @@ jobs:
         with:
           path: artifacts
 
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Collect release files
         run: |
           mkdir -p release
           find artifacts -type f \( -name '*.tar.gz' -o -name '*.sha256' \) -exec cp {} release/ \;
 
+      - name: Render release notes from changelog
+        run: bash scripts/render-release-notes.sh "${GITHUB_REF_NAME#v}" release-notes.md
+
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
         with:
+          body_path: release-notes.md
           files: release/*
           generate_release_notes: true
