@@ -60,7 +60,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ppdns-${{ github.ref_name }}-x86_64-unknown-linux-musl
+          name: ppdns-${{ github.sha }}-x86_64-unknown-linux-musl
           path: |
             dist/*.tar.gz
             dist/*.sha256
