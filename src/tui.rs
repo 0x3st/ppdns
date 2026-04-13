@@ -107,6 +107,7 @@ enum Mode {
 
 struct FilterState {
     value: String,
+    cursor: usize,
 }
 
 struct AddForm {
@@ -115,6 +116,7 @@ struct AddForm {
     content: String,
     ttl: String,
     field: AddField,
+    cursor: usize,
 }
 
 struct EditForm {
@@ -122,12 +124,14 @@ struct EditForm {
     content: String,
     ttl: String,
     field: EditField,
+    cursor: usize,
 }
 
 struct CreateZoneForm {
     zone: String,
     nameserver: String,
     field: CreateZoneField,
+    cursor: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -177,6 +181,7 @@ struct SoaEditForm {
     input: SoaEditInput,
     field: SoaEditField,
     note: Option<String>,
+    cursor: usize,
 }
 
 struct PendingZoneReload {
@@ -824,11 +829,12 @@ impl DnsPanel {
                 Style::default().fg(MUTED),
             )),
             Line::from(""),
-            Line::from(vec![
-                Span::styled("Filter: ", Style::default().fg(BRAND)),
-                Span::styled(state.value.clone(), Style::default().fg(Color::White)),
-                Span::styled("█", Style::default().fg(BRAND)),
-            ]),
+            input_line(
+                "Filter: ".to_string(),
+                Style::default().fg(BRAND),
+                state.value.as_str(),
+                Some(state.cursor),
+            ),
             Line::from(""),
             Line::from(Span::styled(
                 "Enter apply   Esc cancel",
@@ -872,20 +878,16 @@ impl DnsPanel {
         ];
 
         for (label, value, selected) in fields {
-            let style = if selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(BRAND)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(format!("{label:<8}"), Style::default().fg(MUTED)),
-                Span::styled(if value.is_empty() { " " } else { value }, style),
-                Span::styled(if selected { " █" } else { "" }, Style::default().fg(BRAND)),
-            ]));
+            lines.push(input_line(
+                format!("{label:<8}"),
+                if selected {
+                    Style::default().fg(BRAND).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED)
+                },
+                value,
+                selected.then_some(form.cursor),
+            ));
         }
 
         lines.push(Line::from(""));
@@ -933,20 +935,16 @@ impl DnsPanel {
         ];
 
         for (label, value, selected) in fields {
-            let style = if selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(BRAND)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(format!("{label:<8}"), Style::default().fg(MUTED)),
-                Span::styled(if value.is_empty() { " " } else { value }, style),
-                Span::styled(if selected { " █" } else { "" }, Style::default().fg(BRAND)),
-            ]));
+            lines.push(input_line(
+                format!("{label:<8}"),
+                if selected {
+                    Style::default().fg(BRAND).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED)
+                },
+                value,
+                selected.then_some(form.cursor),
+            ));
         }
 
         lines.push(Line::from(""));
@@ -995,20 +993,16 @@ impl DnsPanel {
         ];
 
         for (label, value, selected) in fields {
-            let style = if selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(BRAND)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(format!("{label:<11}"), Style::default().fg(MUTED)),
-                Span::styled(if value.is_empty() { " " } else { value }, style),
-                Span::styled(if selected { " █" } else { "" }, Style::default().fg(BRAND)),
-            ]));
+            lines.push(input_line(
+                format!("{label:<11}"),
+                if selected {
+                    Style::default().fg(BRAND).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED)
+                },
+                value,
+                selected.then_some(form.cursor),
+            ));
         }
 
         lines.push(Line::from(""));
@@ -1170,20 +1164,16 @@ impl DnsPanel {
         }
 
         for (label, value, selected) in fields {
-            let style = if selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(BRAND)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(format!("{label:<11}"), Style::default().fg(MUTED)),
-                Span::styled(if value.is_empty() { " " } else { value }, style),
-                Span::styled(if selected { " █" } else { "" }, Style::default().fg(BRAND)),
-            ]));
+            lines.push(input_line(
+                format!("{label:<11}"),
+                if selected {
+                    Style::default().fg(BRAND).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED)
+                },
+                value,
+                selected.then_some(form.cursor),
+            ));
         }
 
         lines.push(Line::from(""));
@@ -1331,6 +1321,7 @@ impl DnsPanel {
             KeyCode::Char('/') => {
                 self.mode = Mode::Filter(FilterState {
                     value: self.filter.clone(),
+                    cursor: self.filter.chars().count(),
                 });
                 Ok(false)
             }
@@ -1437,12 +1428,32 @@ impl DnsPanel {
                 }));
                 false
             }
+            KeyCode::Left => {
+                state.move_cursor_left();
+                true
+            }
+            KeyCode::Right => {
+                state.move_cursor_right();
+                true
+            }
+            KeyCode::Home => {
+                state.cursor = 0;
+                true
+            }
+            KeyCode::End => {
+                state.cursor = value_char_len(&state.value);
+                true
+            }
             KeyCode::Backspace => {
-                state.value.pop();
+                state.backspace();
+                true
+            }
+            KeyCode::Delete => {
+                state.delete();
                 true
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                state.value.push(ch);
+                state.insert_char(ch);
                 true
             }
             _ => true,
@@ -1460,20 +1471,40 @@ impl DnsPanel {
                 self.submit_create_zone_form(form)?;
                 Ok(false)
             }
-            KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
+            KeyCode::Tab | KeyCode::Down => {
                 form.next_field();
                 Ok(true)
             }
-            KeyCode::BackTab | KeyCode::Up | KeyCode::Left => {
+            KeyCode::BackTab | KeyCode::Up => {
                 form.previous_field();
                 Ok(true)
             }
+            KeyCode::Left => {
+                form.move_cursor_left();
+                Ok(true)
+            }
+            KeyCode::Right => {
+                form.move_cursor_right();
+                Ok(true)
+            }
+            KeyCode::Home => {
+                form.cursor = 0;
+                Ok(true)
+            }
+            KeyCode::End => {
+                form.cursor = value_char_len(form.active_value());
+                Ok(true)
+            }
             KeyCode::Backspace => {
-                form.active_value_mut().pop();
+                form.backspace();
+                Ok(true)
+            }
+            KeyCode::Delete => {
+                form.delete();
                 Ok(true)
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                form.active_value_mut().push(ch);
+                form.insert_char(ch);
                 Ok(true)
             }
             _ => Ok(true),
@@ -1487,20 +1518,40 @@ impl DnsPanel {
                 self.submit_edit_form(form)?;
                 Ok(false)
             }
-            KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
+            KeyCode::Tab | KeyCode::Down => {
                 form.next_field();
                 Ok(true)
             }
-            KeyCode::BackTab | KeyCode::Up | KeyCode::Left => {
+            KeyCode::BackTab | KeyCode::Up => {
                 form.previous_field();
                 Ok(true)
             }
+            KeyCode::Left => {
+                form.move_cursor_left();
+                Ok(true)
+            }
+            KeyCode::Right => {
+                form.move_cursor_right();
+                Ok(true)
+            }
+            KeyCode::Home => {
+                form.cursor = 0;
+                Ok(true)
+            }
+            KeyCode::End => {
+                form.cursor = value_char_len(form.active_value());
+                Ok(true)
+            }
             KeyCode::Backspace => {
-                form.active_value_mut().pop();
+                form.backspace();
+                Ok(true)
+            }
+            KeyCode::Delete => {
+                form.delete();
                 Ok(true)
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                form.active_value_mut().push(ch);
+                form.insert_char(ch);
                 Ok(true)
             }
             _ => Ok(true),
@@ -1536,20 +1587,40 @@ impl DnsPanel {
                 self.submit_soa_edit_form(form)?;
                 Ok(false)
             }
-            KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
+            KeyCode::Tab | KeyCode::Down => {
                 form.next_field();
                 Ok(true)
             }
-            KeyCode::BackTab | KeyCode::Up | KeyCode::Left => {
+            KeyCode::BackTab | KeyCode::Up => {
                 form.previous_field();
                 Ok(true)
             }
+            KeyCode::Left => {
+                form.move_cursor_left();
+                Ok(true)
+            }
+            KeyCode::Right => {
+                form.move_cursor_right();
+                Ok(true)
+            }
+            KeyCode::Home => {
+                form.cursor = 0;
+                Ok(true)
+            }
+            KeyCode::End => {
+                form.cursor = value_char_len(form.active_value());
+                Ok(true)
+            }
             KeyCode::Backspace => {
-                form.active_value_mut().pop();
+                form.backspace();
+                Ok(true)
+            }
+            KeyCode::Delete => {
+                form.delete();
                 Ok(true)
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                form.active_value_mut().push(ch);
+                form.insert_char(ch);
                 Ok(true)
             }
             _ => Ok(true),
@@ -1563,20 +1634,40 @@ impl DnsPanel {
                 self.submit_add_form(form)?;
                 Ok(false)
             }
-            KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
+            KeyCode::Tab | KeyCode::Down => {
                 form.next_field();
                 Ok(true)
             }
-            KeyCode::BackTab | KeyCode::Up | KeyCode::Left => {
+            KeyCode::BackTab | KeyCode::Up => {
                 form.previous_field();
                 Ok(true)
             }
+            KeyCode::Left => {
+                form.move_cursor_left();
+                Ok(true)
+            }
+            KeyCode::Right => {
+                form.move_cursor_right();
+                Ok(true)
+            }
+            KeyCode::Home => {
+                form.cursor = 0;
+                Ok(true)
+            }
+            KeyCode::End => {
+                form.cursor = value_char_len(form.active_value());
+                Ok(true)
+            }
             KeyCode::Backspace => {
-                form.active_value_mut().pop();
+                form.backspace();
+                Ok(true)
+            }
+            KeyCode::Delete => {
+                form.delete();
                 Ok(true)
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                form.active_value_mut().push(ch);
+                form.insert_char(ch);
                 Ok(true)
             }
             _ => Ok(true),
@@ -1596,11 +1687,11 @@ impl DnsPanel {
 
     fn handle_paste(&mut self, text: &str) {
         match &mut self.mode {
-            Mode::Filter(state) => state.value.push_str(text),
-            Mode::CreateZone(form) => form.active_value_mut().push_str(text),
-            Mode::Add(form) => form.active_value_mut().push_str(text),
-            Mode::Edit(form) => form.active_value_mut().push_str(text),
-            Mode::SoaEdit(form) => form.active_value_mut().push_str(text),
+            Mode::Filter(state) => state.insert_str(text),
+            Mode::CreateZone(form) => form.insert_str(text),
+            Mode::Add(form) => form.insert_str(text),
+            Mode::Edit(form) => form.insert_str(text),
+            Mode::SoaEdit(form) => form.insert_str(text),
             Mode::Browse | Mode::Soa(_) | Mode::DeleteConfirm(_) => {}
         }
     }
@@ -2320,6 +2411,7 @@ impl CreateZoneForm {
             zone: String::new(),
             nameserver: "ns1".to_string(),
             field: CreateZoneField::Zone,
+            cursor: 0,
         }
     }
 
@@ -2328,16 +2420,59 @@ impl CreateZoneForm {
             CreateZoneField::Zone => CreateZoneField::Nameserver,
             CreateZoneField::Nameserver => CreateZoneField::Zone,
         };
+        self.cursor = value_char_len(self.active_value());
     }
 
     fn previous_field(&mut self) {
         self.next_field();
     }
 
-    fn active_value_mut(&mut self) -> &mut String {
+    fn active_value(&self) -> &str {
         match self.field {
-            CreateZoneField::Zone => &mut self.zone,
-            CreateZoneField::Nameserver => &mut self.nameserver,
+            CreateZoneField::Zone => &self.zone,
+            CreateZoneField::Nameserver => &self.nameserver,
+        }
+    }
+
+    fn move_cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_cursor_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(value_char_len(self.active_value()));
+    }
+
+    fn backspace(&mut self) {
+        match self.field {
+            CreateZoneField::Zone => backspace_at_cursor(&mut self.zone, &mut self.cursor),
+            CreateZoneField::Nameserver => {
+                backspace_at_cursor(&mut self.nameserver, &mut self.cursor)
+            }
+        }
+    }
+
+    fn delete(&mut self) {
+        match self.field {
+            CreateZoneField::Zone => delete_at_cursor(&mut self.zone, self.cursor),
+            CreateZoneField::Nameserver => delete_at_cursor(&mut self.nameserver, self.cursor),
+        }
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        match self.field {
+            CreateZoneField::Zone => insert_char_at_cursor(&mut self.zone, &mut self.cursor, ch),
+            CreateZoneField::Nameserver => {
+                insert_char_at_cursor(&mut self.nameserver, &mut self.cursor, ch)
+            }
+        }
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        match self.field {
+            CreateZoneField::Zone => insert_str_at_cursor(&mut self.zone, &mut self.cursor, text),
+            CreateZoneField::Nameserver => {
+                insert_str_at_cursor(&mut self.nameserver, &mut self.cursor, text)
+            }
         }
     }
 }
@@ -2354,6 +2489,7 @@ impl EditForm {
             content: record.content.clone(),
             ttl: record.ttl.map(|ttl| ttl.to_string()).unwrap_or_default(),
             field: EditField::Content,
+            cursor: value_char_len(&record.content),
         }
     }
 
@@ -2362,16 +2498,53 @@ impl EditForm {
             EditField::Content => EditField::Ttl,
             EditField::Ttl => EditField::Content,
         };
+        self.cursor = value_char_len(self.active_value());
     }
 
     fn previous_field(&mut self) {
         self.next_field();
     }
 
-    fn active_value_mut(&mut self) -> &mut String {
+    fn active_value(&self) -> &str {
         match self.field {
-            EditField::Content => &mut self.content,
-            EditField::Ttl => &mut self.ttl,
+            EditField::Content => &self.content,
+            EditField::Ttl => &self.ttl,
+        }
+    }
+
+    fn move_cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_cursor_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(value_char_len(self.active_value()));
+    }
+
+    fn backspace(&mut self) {
+        match self.field {
+            EditField::Content => backspace_at_cursor(&mut self.content, &mut self.cursor),
+            EditField::Ttl => backspace_at_cursor(&mut self.ttl, &mut self.cursor),
+        }
+    }
+
+    fn delete(&mut self) {
+        match self.field {
+            EditField::Content => delete_at_cursor(&mut self.content, self.cursor),
+            EditField::Ttl => delete_at_cursor(&mut self.ttl, self.cursor),
+        }
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        match self.field {
+            EditField::Content => insert_char_at_cursor(&mut self.content, &mut self.cursor, ch),
+            EditField::Ttl => insert_char_at_cursor(&mut self.ttl, &mut self.cursor, ch),
+        }
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        match self.field {
+            EditField::Content => insert_str_at_cursor(&mut self.content, &mut self.cursor, text),
+            EditField::Ttl => insert_str_at_cursor(&mut self.ttl, &mut self.cursor, text),
         }
     }
 }
@@ -2389,11 +2562,15 @@ impl SoaEditForm {
             dialog.inspection.warning.clone()
         };
 
+        let input = SoaEditInput::from_apex_soa(&dialog.inspection.apex_soa);
+        let cursor = value_char_len(&input.primary_nameserver);
+
         Self {
             zone: dialog.zone.clone(),
-            input: SoaEditInput::from_apex_soa(&dialog.inspection.apex_soa),
+            input,
             field: SoaEditField::PrimaryNameserver,
             note,
+            cursor,
         }
     }
 
@@ -2408,6 +2585,7 @@ impl SoaEditForm {
             SoaEditField::Minimum => SoaEditField::Ttl,
             SoaEditField::Ttl => SoaEditField::PrimaryNameserver,
         };
+        self.cursor = value_char_len(self.active_value());
     }
 
     fn previous_field(&mut self) {
@@ -2421,18 +2599,111 @@ impl SoaEditForm {
             SoaEditField::Minimum => SoaEditField::Expire,
             SoaEditField::Ttl => SoaEditField::Minimum,
         };
+        self.cursor = value_char_len(self.active_value());
     }
 
-    fn active_value_mut(&mut self) -> &mut String {
+    fn active_value(&self) -> &str {
         match self.field {
-            SoaEditField::PrimaryNameserver => &mut self.input.primary_nameserver,
-            SoaEditField::Mailbox => &mut self.input.mailbox,
-            SoaEditField::Serial => &mut self.input.serial,
-            SoaEditField::Refresh => &mut self.input.refresh,
-            SoaEditField::Retry => &mut self.input.retry,
-            SoaEditField::Expire => &mut self.input.expire,
-            SoaEditField::Minimum => &mut self.input.minimum,
-            SoaEditField::Ttl => &mut self.input.ttl,
+            SoaEditField::PrimaryNameserver => &self.input.primary_nameserver,
+            SoaEditField::Mailbox => &self.input.mailbox,
+            SoaEditField::Serial => &self.input.serial,
+            SoaEditField::Refresh => &self.input.refresh,
+            SoaEditField::Retry => &self.input.retry,
+            SoaEditField::Expire => &self.input.expire,
+            SoaEditField::Minimum => &self.input.minimum,
+            SoaEditField::Ttl => &self.input.ttl,
+        }
+    }
+
+    fn move_cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_cursor_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(value_char_len(self.active_value()));
+    }
+
+    fn backspace(&mut self) {
+        match self.field {
+            SoaEditField::PrimaryNameserver => {
+                backspace_at_cursor(&mut self.input.primary_nameserver, &mut self.cursor)
+            }
+            SoaEditField::Mailbox => backspace_at_cursor(&mut self.input.mailbox, &mut self.cursor),
+            SoaEditField::Serial => backspace_at_cursor(&mut self.input.serial, &mut self.cursor),
+            SoaEditField::Refresh => backspace_at_cursor(&mut self.input.refresh, &mut self.cursor),
+            SoaEditField::Retry => backspace_at_cursor(&mut self.input.retry, &mut self.cursor),
+            SoaEditField::Expire => backspace_at_cursor(&mut self.input.expire, &mut self.cursor),
+            SoaEditField::Minimum => backspace_at_cursor(&mut self.input.minimum, &mut self.cursor),
+            SoaEditField::Ttl => backspace_at_cursor(&mut self.input.ttl, &mut self.cursor),
+        }
+    }
+
+    fn delete(&mut self) {
+        match self.field {
+            SoaEditField::PrimaryNameserver => {
+                delete_at_cursor(&mut self.input.primary_nameserver, self.cursor)
+            }
+            SoaEditField::Mailbox => delete_at_cursor(&mut self.input.mailbox, self.cursor),
+            SoaEditField::Serial => delete_at_cursor(&mut self.input.serial, self.cursor),
+            SoaEditField::Refresh => delete_at_cursor(&mut self.input.refresh, self.cursor),
+            SoaEditField::Retry => delete_at_cursor(&mut self.input.retry, self.cursor),
+            SoaEditField::Expire => delete_at_cursor(&mut self.input.expire, self.cursor),
+            SoaEditField::Minimum => delete_at_cursor(&mut self.input.minimum, self.cursor),
+            SoaEditField::Ttl => delete_at_cursor(&mut self.input.ttl, self.cursor),
+        }
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        match self.field {
+            SoaEditField::PrimaryNameserver => {
+                insert_char_at_cursor(&mut self.input.primary_nameserver, &mut self.cursor, ch)
+            }
+            SoaEditField::Mailbox => {
+                insert_char_at_cursor(&mut self.input.mailbox, &mut self.cursor, ch)
+            }
+            SoaEditField::Serial => {
+                insert_char_at_cursor(&mut self.input.serial, &mut self.cursor, ch)
+            }
+            SoaEditField::Refresh => {
+                insert_char_at_cursor(&mut self.input.refresh, &mut self.cursor, ch)
+            }
+            SoaEditField::Retry => {
+                insert_char_at_cursor(&mut self.input.retry, &mut self.cursor, ch)
+            }
+            SoaEditField::Expire => {
+                insert_char_at_cursor(&mut self.input.expire, &mut self.cursor, ch)
+            }
+            SoaEditField::Minimum => {
+                insert_char_at_cursor(&mut self.input.minimum, &mut self.cursor, ch)
+            }
+            SoaEditField::Ttl => insert_char_at_cursor(&mut self.input.ttl, &mut self.cursor, ch),
+        }
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        match self.field {
+            SoaEditField::PrimaryNameserver => {
+                insert_str_at_cursor(&mut self.input.primary_nameserver, &mut self.cursor, text)
+            }
+            SoaEditField::Mailbox => {
+                insert_str_at_cursor(&mut self.input.mailbox, &mut self.cursor, text)
+            }
+            SoaEditField::Serial => {
+                insert_str_at_cursor(&mut self.input.serial, &mut self.cursor, text)
+            }
+            SoaEditField::Refresh => {
+                insert_str_at_cursor(&mut self.input.refresh, &mut self.cursor, text)
+            }
+            SoaEditField::Retry => {
+                insert_str_at_cursor(&mut self.input.retry, &mut self.cursor, text)
+            }
+            SoaEditField::Expire => {
+                insert_str_at_cursor(&mut self.input.expire, &mut self.cursor, text)
+            }
+            SoaEditField::Minimum => {
+                insert_str_at_cursor(&mut self.input.minimum, &mut self.cursor, text)
+            }
+            SoaEditField::Ttl => insert_str_at_cursor(&mut self.input.ttl, &mut self.cursor, text),
         }
     }
 }
@@ -2445,6 +2716,7 @@ impl AddForm {
             content: String::new(),
             ttl: String::new(),
             field: AddField::Type,
+            cursor: 1,
         }
     }
 
@@ -2455,6 +2727,7 @@ impl AddForm {
             AddField::Content => AddField::Ttl,
             AddField::Ttl => AddField::Type,
         };
+        self.cursor = value_char_len(self.active_value());
     }
 
     fn previous_field(&mut self) {
@@ -2464,14 +2737,59 @@ impl AddForm {
             AddField::Content => AddField::Name,
             AddField::Ttl => AddField::Content,
         };
+        self.cursor = value_char_len(self.active_value());
     }
 
-    fn active_value_mut(&mut self) -> &mut String {
+    fn active_value(&self) -> &str {
         match self.field {
-            AddField::Type => &mut self.record_type,
-            AddField::Name => &mut self.name,
-            AddField::Content => &mut self.content,
-            AddField::Ttl => &mut self.ttl,
+            AddField::Type => &self.record_type,
+            AddField::Name => &self.name,
+            AddField::Content => &self.content,
+            AddField::Ttl => &self.ttl,
+        }
+    }
+
+    fn move_cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_cursor_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(value_char_len(self.active_value()));
+    }
+
+    fn backspace(&mut self) {
+        match self.field {
+            AddField::Type => backspace_at_cursor(&mut self.record_type, &mut self.cursor),
+            AddField::Name => backspace_at_cursor(&mut self.name, &mut self.cursor),
+            AddField::Content => backspace_at_cursor(&mut self.content, &mut self.cursor),
+            AddField::Ttl => backspace_at_cursor(&mut self.ttl, &mut self.cursor),
+        }
+    }
+
+    fn delete(&mut self) {
+        match self.field {
+            AddField::Type => delete_at_cursor(&mut self.record_type, self.cursor),
+            AddField::Name => delete_at_cursor(&mut self.name, self.cursor),
+            AddField::Content => delete_at_cursor(&mut self.content, self.cursor),
+            AddField::Ttl => delete_at_cursor(&mut self.ttl, self.cursor),
+        }
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        match self.field {
+            AddField::Type => insert_char_at_cursor(&mut self.record_type, &mut self.cursor, ch),
+            AddField::Name => insert_char_at_cursor(&mut self.name, &mut self.cursor, ch),
+            AddField::Content => insert_char_at_cursor(&mut self.content, &mut self.cursor, ch),
+            AddField::Ttl => insert_char_at_cursor(&mut self.ttl, &mut self.cursor, ch),
+        }
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        match self.field {
+            AddField::Type => insert_str_at_cursor(&mut self.record_type, &mut self.cursor, text),
+            AddField::Name => insert_str_at_cursor(&mut self.name, &mut self.cursor, text),
+            AddField::Content => insert_str_at_cursor(&mut self.content, &mut self.cursor, text),
+            AddField::Ttl => insert_str_at_cursor(&mut self.ttl, &mut self.cursor, text),
         }
     }
 }
@@ -2503,6 +2821,32 @@ impl FlashMessage {
     }
 }
 
+impl FilterState {
+    fn move_cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_cursor_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(value_char_len(&self.value));
+    }
+
+    fn backspace(&mut self) {
+        backspace_at_cursor(&mut self.value, &mut self.cursor);
+    }
+
+    fn delete(&mut self) {
+        delete_at_cursor(&mut self.value, self.cursor);
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        insert_char_at_cursor(&mut self.value, &mut self.cursor, ch);
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        insert_str_at_cursor(&mut self.value, &mut self.cursor, text);
+    }
+}
+
 fn flash_duration(kind: FlashKind) -> Duration {
     match kind {
         FlashKind::Info => Duration::from_secs(3),
@@ -2510,6 +2854,109 @@ fn flash_duration(kind: FlashKind) -> Duration {
         FlashKind::Warning => Duration::from_secs(6),
         FlashKind::Error => Duration::from_secs(8),
     }
+}
+
+fn input_line(
+    label: String,
+    label_style: Style,
+    value: &str,
+    cursor: Option<usize>,
+) -> Line<'static> {
+    let mut spans = vec![Span::styled(label, label_style)];
+
+    match cursor {
+        None => spans.push(Span::styled(
+            if value.is_empty() {
+                " ".to_string()
+            } else {
+                value.to_string()
+            },
+            Style::default().fg(Color::White),
+        )),
+        Some(cursor) => {
+            let cursor = clamp_cursor(cursor, value);
+            let cursor_byte = char_to_byte_index(value, cursor);
+            let value_style = Style::default().fg(Color::White);
+            let cursor_style = Style::default()
+                .fg(Color::Black)
+                .bg(BRAND)
+                .add_modifier(Modifier::BOLD);
+
+            if cursor_byte > 0 {
+                spans.push(Span::styled(value[..cursor_byte].to_string(), value_style));
+            }
+
+            if cursor < value_char_len(value) {
+                let next_byte = char_to_byte_index(value, cursor + 1);
+                spans.push(Span::styled(
+                    value[cursor_byte..next_byte].to_string(),
+                    cursor_style,
+                ));
+                if next_byte < value.len() {
+                    spans.push(Span::styled(value[next_byte..].to_string(), value_style));
+                }
+            } else {
+                spans.push(Span::styled("█", Style::default().fg(BRAND)));
+            }
+        }
+    }
+
+    Line::from(spans)
+}
+
+fn value_char_len(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn clamp_cursor(cursor: usize, value: &str) -> usize {
+    cursor.min(value_char_len(value))
+}
+
+fn char_to_byte_index(value: &str, char_index: usize) -> usize {
+    if char_index == 0 {
+        return 0;
+    }
+
+    value
+        .char_indices()
+        .nth(char_index)
+        .map(|(byte_index, _)| byte_index)
+        .unwrap_or_else(|| value.len())
+}
+
+fn insert_char_at_cursor(value: &mut String, cursor: &mut usize, ch: char) {
+    let insert_at = char_to_byte_index(value, clamp_cursor(*cursor, value));
+    value.insert(insert_at, ch);
+    *cursor += 1;
+}
+
+fn insert_str_at_cursor(value: &mut String, cursor: &mut usize, text: &str) {
+    let insert_at = char_to_byte_index(value, clamp_cursor(*cursor, value));
+    value.insert_str(insert_at, text);
+    *cursor += text.chars().count();
+}
+
+fn backspace_at_cursor(value: &mut String, cursor: &mut usize) {
+    let cursor_pos = clamp_cursor(*cursor, value);
+    if cursor_pos == 0 {
+        return;
+    }
+
+    let remove_start = char_to_byte_index(value, cursor_pos - 1);
+    let remove_end = char_to_byte_index(value, cursor_pos);
+    value.replace_range(remove_start..remove_end, "");
+    *cursor -= 1;
+}
+
+fn delete_at_cursor(value: &mut String, cursor: usize) {
+    let cursor_pos = clamp_cursor(cursor, value);
+    if cursor_pos >= value_char_len(value) {
+        return;
+    }
+
+    let remove_start = char_to_byte_index(value, cursor_pos);
+    let remove_end = char_to_byte_index(value, cursor_pos + 1);
+    value.replace_range(remove_start..remove_end, "");
 }
 
 fn normalize_add_content(record_type: &str, content: &str, zone: &str) -> AppResult<String> {
