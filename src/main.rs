@@ -136,6 +136,21 @@ struct AddRecordSpec {
 }
 
 #[derive(Debug, Clone)]
+struct CreateZoneSpec {
+    zone: String,
+    primary_nameserver: String,
+}
+
+#[derive(Debug, Clone)]
+struct ReplaceRrsetSpec {
+    zone: String,
+    name: String,
+    record_type: String,
+    ttl: Option<u32>,
+    contents: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 struct DeleteRecordSpec {
     zone: String,
     name: String,
@@ -149,6 +164,15 @@ struct ZoneRecord {
     ttl: Option<u32>,
     record_type: String,
     content: String,
+}
+
+#[derive(Debug, Clone)]
+struct SoaInspection {
+    apex_soa: Vec<ZoneRecord>,
+    non_apex_soa_count: usize,
+    warning: Option<String>,
+    repair_spec: Option<ReplaceRrsetSpec>,
+    repair_summary: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -505,6 +529,47 @@ impl PdnsUtil {
         args
     }
 
+    fn replace_rrset_args(&self, spec: &ReplaceRrsetSpec) -> Vec<String> {
+        let mut args = match self.syntax {
+            PdnsSyntax::Modern => vec![
+                "rrset".to_string(),
+                "replace".to_string(),
+                spec.zone.clone(),
+                spec.name.clone(),
+                spec.record_type.clone(),
+            ],
+            PdnsSyntax::Legacy => vec![
+                "replace-rrset".to_string(),
+                spec.zone.clone(),
+                legacy_owner_name_arg(&spec.zone, &spec.name),
+                spec.record_type.clone(),
+            ],
+        };
+
+        if let Some(ttl) = spec.ttl {
+            args.push(ttl.to_string());
+        }
+
+        args.extend(spec.contents.iter().cloned());
+        args
+    }
+
+    fn create_zone_args(&self, spec: &CreateZoneSpec) -> Vec<String> {
+        match self.syntax {
+            PdnsSyntax::Modern => vec![
+                "zone".to_string(),
+                "create".to_string(),
+                spec.zone.clone(),
+                spec.primary_nameserver.trim_end_matches('.').to_string(),
+            ],
+            PdnsSyntax::Legacy => vec![
+                "create-zone".to_string(),
+                spec.zone.clone(),
+                spec.primary_nameserver.trim_end_matches('.').to_string(),
+            ],
+        }
+    }
+
     fn increase_serial_args(&self, zone: &str) -> Vec<String> {
         match self.syntax {
             PdnsSyntax::Modern => vec![
@@ -537,43 +602,26 @@ impl PdnsUtil {
                     ttl,
                     remaining_contents,
                 },
-            ) => {
-                let mut args = vec![
-                    "rrset".to_string(),
-                    "replace".to_string(),
-                    plan.zone.clone(),
-                    plan.name.clone(),
-                    plan.record_type.clone(),
-                ];
-
-                if let Some(ttl) = ttl {
-                    args.push(ttl.to_string());
-                }
-
-                args.extend(remaining_contents.iter().cloned());
-                args
-            }
+            ) => self.replace_rrset_args(&ReplaceRrsetSpec {
+                zone: plan.zone.clone(),
+                name: plan.name.clone(),
+                record_type: plan.record_type.clone(),
+                ttl: *ttl,
+                contents: remaining_contents.clone(),
+            }),
             (
                 PdnsSyntax::Legacy,
                 DeleteMethod::Replace {
                     ttl,
                     remaining_contents,
                 },
-            ) => {
-                let mut args = vec![
-                    "replace-rrset".to_string(),
-                    plan.zone.clone(),
-                    legacy_owner_name_arg(&plan.zone, &plan.name),
-                    plan.record_type.clone(),
-                ];
-
-                if let Some(ttl) = ttl {
-                    args.push(ttl.to_string());
-                }
-
-                args.extend(remaining_contents.iter().cloned());
-                args
-            }
+            ) => self.replace_rrset_args(&ReplaceRrsetSpec {
+                zone: plan.zone.clone(),
+                name: plan.name.clone(),
+                record_type: plan.record_type.clone(),
+                ttl: *ttl,
+                contents: remaining_contents.clone(),
+            }),
         }
     }
 
@@ -876,7 +924,8 @@ fn execute_add_record(runner: &PdnsUtil, args: AddRecordArgs) -> AppResult<()> {
     }
 
     runner.add_record(&spec)?;
-    verify_add_record_applied(runner, &spec)?;
+    let records = verify_add_record_applied(runner, &spec)?;
+    print_zone_health_warning(&spec.zone, &records);
     println!("Record added.");
     handle_serial_bump_result(runner, &spec.zone, "add")?;
     Ok(())
@@ -925,7 +974,8 @@ fn execute_delete_record(runner: &PdnsUtil, args: DeleteRecordArgs) -> AppResult
     }
 
     runner.apply_delete_plan(&plan)?;
-    verify_delete_record_applied(runner, &spec, &plan)?;
+    let records = verify_delete_record_applied(runner, &spec, &plan)?;
+    print_zone_health_warning(&spec.zone, &records);
     println!("Record deleted.");
     handle_serial_bump_result(runner, &spec.zone, "delete")?;
     Ok(())
@@ -964,6 +1014,60 @@ fn handle_serial_bump_result(runner: &PdnsUtil, zone: &str, operation: &str) -> 
             );
             Ok(())
         }
+    }
+}
+
+fn print_zone_health_warning(zone: &str, records: &[ZoneRecord]) {
+    if let Some(warning) = zone_health_warning(zone, records) {
+        eprintln!("Warning: {warning}");
+    }
+}
+
+fn verify_zone_created(runner: &PdnsUtil, spec: &CreateZoneSpec) -> AppResult<Vec<ZoneRecord>> {
+    let zones = runner.list_zones()?;
+    if !zones.contains(&spec.zone) {
+        return Err(AppError::Message(build_mutation_state_error(
+            runner,
+            format!(
+                "zone create finished, but `{}` is still missing after reload",
+                spec.zone
+            ),
+        )));
+    }
+
+    let records = runner.list_zone_records(&spec.zone)?;
+    let has_primary_ns = records.iter().any(|record| {
+        record.name == spec.zone
+            && record.record_type.eq_ignore_ascii_case("NS")
+            && normalize_zone_name(&record.content) == spec.primary_nameserver
+    });
+
+    if !has_primary_ns {
+        return Err(AppError::Message(build_mutation_state_error(
+            runner,
+            format!(
+                "zone create finished, but apex NS `{}` is still missing after reload",
+                spec.primary_nameserver
+            ),
+        )));
+    }
+
+    Ok(records)
+}
+
+fn verify_rrset_replaced(runner: &PdnsUtil, spec: &ReplaceRrsetSpec) -> AppResult<Vec<ZoneRecord>> {
+    let records = runner.list_zone_records(&spec.zone)?;
+
+    if rrset_matches_replace_spec(&records, spec) {
+        Ok(records)
+    } else {
+        Err(AppError::Message(build_mutation_state_error(
+            runner,
+            format!(
+                "replace command finished, but rrset `{}` `{}` does not match the expected state after reload",
+                spec.name, spec.record_type
+            ),
+        )))
     }
 }
 
@@ -1028,12 +1132,110 @@ fn build_mutation_state_error(runner: &PdnsUtil, detail: String) -> String {
     format!("{detail}.{suffix}")
 }
 
+fn inspect_zone_soa(zone: &str, records: &[ZoneRecord]) -> SoaInspection {
+    let apex_soa = records
+        .iter()
+        .filter(|record| record.name == zone && record.record_type.eq_ignore_ascii_case("SOA"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let non_apex_soa_count = records
+        .iter()
+        .filter(|record| record.name != zone && record.record_type.eq_ignore_ascii_case("SOA"))
+        .count();
+    let repair_spec = build_soa_repair_spec(zone, &apex_soa);
+    let repair_summary = repair_spec.as_ref().and_then(|spec| {
+        spec.contents.first().map(|content| {
+            format!(
+                "repair available: rewrite SOA mailbox and keep serial/content fields intact -> {}",
+                content
+            )
+        })
+    });
+    let warning = zone_health_warning_parts(&apex_soa, non_apex_soa_count);
+
+    SoaInspection {
+        apex_soa,
+        non_apex_soa_count,
+        warning,
+        repair_spec,
+        repair_summary,
+    }
+}
+
+fn zone_health_warning(zone: &str, records: &[ZoneRecord]) -> Option<String> {
+    let inspection = inspect_zone_soa(zone, records);
+    zone_health_warning_parts(&inspection.apex_soa, inspection.non_apex_soa_count)
+}
+
+fn zone_health_warning_parts(apex_soa: &[ZoneRecord], non_apex_soa_count: usize) -> Option<String> {
+    let mut warnings = Vec::new();
+
+    if apex_soa.is_empty() {
+        warnings.push("zone has no apex SOA record; serial automation may fail".to_string());
+    } else if apex_soa.len() > 1 {
+        warnings.push(format!(
+            "zone has {} apex SOA records; serial automation may fail",
+            apex_soa.len()
+        ));
+    }
+
+    if non_apex_soa_count > 0 {
+        warnings.push(format!(
+            "zone has {} non-apex SOA record(s); check zone data",
+            non_apex_soa_count
+        ));
+    }
+
+    if apex_soa.iter().any(|record| record.content.contains('@')) {
+        warnings.push(
+            "SOA content still contains `@`; PowerDNS 4.6+ no longer rewrites SOA mailboxes"
+                .to_string(),
+        );
+    }
+
+    if apex_soa
+        .iter()
+        .any(|record| soa_content_tokens(&record.content).is_none())
+    {
+        warnings.push("SOA content is malformed; automatic repair is unavailable".to_string());
+    }
+
+    if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join("; "))
+    }
+}
+
 fn add_record_exists(records: &[ZoneRecord], spec: &AddRecordSpec) -> bool {
     records.iter().any(|record| {
         record.name == spec.name
             && record.record_type.eq_ignore_ascii_case(&spec.record_type)
             && record.content == spec.content
     })
+}
+
+fn rrset_matches_replace_spec(records: &[ZoneRecord], spec: &ReplaceRrsetSpec) -> bool {
+    let rrset_records = records_for_rrset(records, &spec.name, &spec.record_type);
+    if rrset_records.len() != spec.contents.len() {
+        return false;
+    }
+
+    let ttl_matches = rrset_records.iter().all(|record| record.ttl == spec.ttl);
+    if !ttl_matches {
+        return false;
+    }
+
+    let mut expected_contents = spec.contents.clone();
+    expected_contents.sort();
+
+    let mut actual_contents = rrset_records
+        .iter()
+        .map(|record| record.content.clone())
+        .collect::<Vec<_>>();
+    actual_contents.sort();
+
+    actual_contents == expected_contents
 }
 
 fn delete_plan_matches_records(
@@ -1060,6 +1262,111 @@ fn delete_plan_matches_records(
             actual_contents == expected_contents
         }
     }
+}
+
+fn build_edit_replace_spec(
+    records: &[ZoneRecord],
+    current: &DeleteRecordSpec,
+    new_content: String,
+    new_ttl: Option<u32>,
+) -> AppResult<ReplaceRrsetSpec> {
+    if current.record_type.eq_ignore_ascii_case("SOA") {
+        return Err(AppError::Message(
+            "use the SOA panel to inspect or repair SOA records".to_string(),
+        ));
+    }
+
+    let rrset_records = records_for_rrset(records, &current.name, &current.record_type);
+    if rrset_records.is_empty() {
+        return Err(AppError::Message(format!(
+            "rrset not found: {} {}",
+            current.name, current.record_type
+        )));
+    }
+
+    let mut replaced = false;
+    let mut contents = Vec::new();
+
+    for record in rrset_records {
+        let content = if !replaced && record.content == current.content {
+            replaced = true;
+            new_content.clone()
+        } else {
+            record.content.clone()
+        };
+
+        if !contents.iter().any(|existing| existing == &content) {
+            contents.push(content);
+        }
+    }
+
+    if !replaced {
+        return Err(AppError::Message(format!(
+            "record content not found in rrset: {} {} {}",
+            current.name, current.record_type, current.content
+        )));
+    }
+
+    Ok(ReplaceRrsetSpec {
+        zone: current.zone.clone(),
+        name: current.name.clone(),
+        record_type: current.record_type.clone(),
+        ttl: new_ttl,
+        contents,
+    })
+}
+
+fn build_soa_repair_spec(zone: &str, apex_soa: &[ZoneRecord]) -> Option<ReplaceRrsetSpec> {
+    if apex_soa.len() != 1 {
+        return None;
+    }
+
+    let record = apex_soa.first()?;
+    let tokens = soa_content_tokens(&record.content)?;
+    let normalized_rname = normalize_soa_mailbox(&tokens[1])?;
+    if normalized_rname == tokens[1] {
+        return None;
+    }
+
+    let new_content = format!(
+        "{} {} {}",
+        tokens[0],
+        normalized_rname,
+        tokens[2..].join(" ")
+    );
+
+    Some(ReplaceRrsetSpec {
+        zone: zone.to_string(),
+        name: zone.to_string(),
+        record_type: "SOA".to_string(),
+        ttl: record.ttl,
+        contents: vec![new_content],
+    })
+}
+
+fn soa_content_tokens(content: &str) -> Option<Vec<String>> {
+    let tokens = content
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if tokens.len() < 7 {
+        None
+    } else {
+        Some(tokens)
+    }
+}
+
+fn normalize_soa_mailbox(value: &str) -> Option<String> {
+    let (local_part, domain_part) = value.split_once('@')?;
+    if local_part.is_empty() || domain_part.is_empty() {
+        return None;
+    }
+
+    let escaped_local = local_part.replace('.', "\\.");
+    Some(format!(
+        "{escaped_local}.{}",
+        normalize_zone_name(domain_part)
+    ))
 }
 
 fn legacy_owner_name_arg(zone: &str, name: &str) -> String {
@@ -1334,6 +1641,36 @@ fn resolve_add_record_spec(runner: &PdnsUtil, args: AddRecordArgs) -> AppResult<
         record_type,
         content,
         ttl,
+    })
+}
+
+fn build_create_zone_spec(
+    runner: &PdnsUtil,
+    zone_input: &str,
+    nameserver_input: &str,
+) -> AppResult<CreateZoneSpec> {
+    let zone = normalize_zone_name(zone_input);
+    if zone == "." {
+        return Err(AppError::Message("zone name is required".to_string()));
+    }
+
+    let zones = runner.list_zones()?;
+    if zones.contains(&zone) {
+        return Err(AppError::Message(format!(
+            "zone `{zone}` already exists in PowerDNS"
+        )));
+    }
+
+    let nameserver = nameserver_input.trim();
+    if nameserver.is_empty() {
+        return Err(AppError::Message(
+            "primary nameserver is required".to_string(),
+        ));
+    }
+
+    Ok(CreateZoneSpec {
+        zone: zone.clone(),
+        primary_nameserver: normalize_target_name(nameserver, &zone),
     })
 }
 
@@ -2871,6 +3208,72 @@ mod tests {
     }
 
     #[test]
+    fn edit_replace_spec_updates_selected_value_only() {
+        let records = vec![
+            ZoneRecord {
+                name: "www.example.com.".to_string(),
+                ttl: Some(300),
+                record_type: "A".to_string(),
+                content: "1.1.1.1".to_string(),
+            },
+            ZoneRecord {
+                name: "www.example.com.".to_string(),
+                ttl: Some(300),
+                record_type: "A".to_string(),
+                content: "2.2.2.2".to_string(),
+            },
+        ];
+        let current = DeleteRecordSpec {
+            zone: "example.com.".to_string(),
+            name: "www.example.com.".to_string(),
+            record_type: "A".to_string(),
+            content: "1.1.1.1".to_string(),
+        };
+
+        let spec = build_edit_replace_spec(&records, &current, "3.3.3.3".to_string(), Some(600))
+            .expect("edit spec should build");
+
+        assert_eq!(spec.zone, "example.com.");
+        assert_eq!(spec.name, "www.example.com.");
+        assert_eq!(spec.record_type, "A");
+        assert_eq!(spec.ttl, Some(600));
+        assert_eq!(
+            spec.contents,
+            vec!["3.3.3.3".to_string(), "2.2.2.2".to_string()]
+        );
+    }
+
+    #[test]
+    fn normalize_soa_mailbox_rewrites_email_form() {
+        assert_eq!(
+            normalize_soa_mailbox("host.master@example.com"),
+            Some("host\\.master.example.com.".to_string())
+        );
+    }
+
+    #[test]
+    fn soa_repair_spec_rewrites_mailbox_only() {
+        let apex_soa = vec![ZoneRecord {
+            name: "example.com.".to_string(),
+            ttl: Some(300),
+            record_type: "SOA".to_string(),
+            content: "ns1.example.com. hostmaster@example.com 1 3600 600 1209600 300".to_string(),
+        }];
+
+        let spec = build_soa_repair_spec("example.com.", &apex_soa)
+            .expect("repair spec should be available");
+
+        assert_eq!(spec.zone, "example.com.");
+        assert_eq!(spec.name, "example.com.");
+        assert_eq!(spec.record_type, "SOA");
+        assert_eq!(spec.ttl, Some(300));
+        assert_eq!(
+            spec.contents,
+            vec!["ns1.example.com. hostmaster.example.com. 1 3600 600 1209600 300".to_string()]
+        );
+    }
+
+    #[test]
     fn detects_legacy_pdnsutil_syntax() {
         let help = "Commands:\nlist-all-zones\nlist-zone ZONE\nadd-record ZONE NAME TYPE";
         assert_eq!(detect_pdns_syntax(help), PdnsSyntax::Legacy);
@@ -2880,6 +3283,49 @@ mod tests {
     fn detects_modern_pdnsutil_syntax() {
         let help = "Commands:\nzone list-all\nzone list ZONE\nrrset add ZONE NAME TYPE";
         assert_eq!(detect_pdns_syntax(help), PdnsSyntax::Modern);
+    }
+
+    #[test]
+    fn modern_create_zone_uses_object_style_command() {
+        let runner = PdnsUtil {
+            global: GlobalOptions::default(),
+            syntax: PdnsSyntax::Modern,
+        };
+        let spec = CreateZoneSpec {
+            zone: "example.com.".to_string(),
+            primary_nameserver: "ns1.example.com.".to_string(),
+        };
+
+        assert_eq!(
+            runner.create_zone_args(&spec),
+            vec![
+                "zone".to_string(),
+                "create".to_string(),
+                "example.com.".to_string(),
+                "ns1.example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_create_zone_uses_old_pdnsutil_form() {
+        let runner = PdnsUtil {
+            global: GlobalOptions::default(),
+            syntax: PdnsSyntax::Legacy,
+        };
+        let spec = CreateZoneSpec {
+            zone: "example.com.".to_string(),
+            primary_nameserver: "ns1.example.com.".to_string(),
+        };
+
+        assert_eq!(
+            runner.create_zone_args(&spec),
+            vec![
+                "create-zone".to_string(),
+                "example.com.".to_string(),
+                "ns1.example.com".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -2994,6 +3440,39 @@ mod tests {
                 "increase-serial".to_string(),
                 "example.com.".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn zone_health_warning_reports_missing_apex_soa() {
+        let records = vec![ZoneRecord {
+            name: "example.com.".to_string(),
+            ttl: Some(300),
+            record_type: "NS".to_string(),
+            content: "ns1.example.com.".to_string(),
+        }];
+
+        assert_eq!(
+            zone_health_warning("example.com.", &records),
+            Some("zone has no apex SOA record; serial automation may fail".to_string())
+        );
+    }
+
+    #[test]
+    fn zone_health_warning_reports_at_sign_mailbox() {
+        let records = vec![ZoneRecord {
+            name: "example.com.".to_string(),
+            ttl: Some(300),
+            record_type: "SOA".to_string(),
+            content: "ns1.example.com. hostmaster@example.com. 1 3600 600 1209600 300".to_string(),
+        }];
+
+        assert_eq!(
+            zone_health_warning("example.com.", &records),
+            Some(
+                "SOA content still contains `@`; PowerDNS 4.6+ no longer rewrites SOA mailboxes"
+                    .to_string()
+            )
         );
     }
 

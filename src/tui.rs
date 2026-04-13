@@ -97,7 +97,10 @@ enum Focus {
 enum Mode {
     Browse,
     Filter(FilterState),
+    CreateZone(CreateZoneForm),
     Add(AddForm),
+    Edit(EditForm),
+    Soa(SoaDialog),
     DeleteConfirm(DeleteDialog),
 }
 
@@ -113,6 +116,31 @@ struct AddForm {
     field: AddField,
 }
 
+struct EditForm {
+    spec: DeleteRecordSpec,
+    content: String,
+    ttl: String,
+    field: EditField,
+}
+
+struct CreateZoneForm {
+    zone: String,
+    nameserver: String,
+    field: CreateZoneField,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CreateZoneField {
+    Zone,
+    Nameserver,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditField {
+    Content,
+    Ttl,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AddField {
     Type,
@@ -124,6 +152,11 @@ enum AddField {
 struct DeleteDialog {
     spec: DeleteRecordSpec,
     warning: bool,
+}
+
+struct SoaDialog {
+    zone: String,
+    inspection: SoaInspection,
 }
 
 struct PendingZoneReload {
@@ -150,17 +183,41 @@ enum BackgroundEvent {
 }
 
 enum MutationResult {
+    CreateZone {
+        zone: String,
+        zones: Vec<String>,
+        records: Vec<ZoneRecord>,
+        output: Option<String>,
+        zone_warning: Option<String>,
+    },
     Add {
         spec: AddRecordSpec,
         records: Vec<ZoneRecord>,
         output: Option<String>,
         serial_warning: Option<String>,
+        zone_warning: Option<String>,
+    },
+    Edit {
+        spec: DeleteRecordSpec,
+        replace_spec: ReplaceRrsetSpec,
+        records: Vec<ZoneRecord>,
+        output: Option<String>,
+        serial_warning: Option<String>,
+        zone_warning: Option<String>,
+    },
+    RepairSoa {
+        zone: String,
+        records: Vec<ZoneRecord>,
+        output: Option<String>,
+        serial_warning: Option<String>,
+        zone_warning: Option<String>,
     },
     Delete {
         spec: DeleteRecordSpec,
         records: Vec<ZoneRecord>,
         output: Option<String>,
         serial_warning: Option<String>,
+        zone_warning: Option<String>,
     },
 }
 
@@ -347,11 +404,35 @@ impl DnsPanel {
                 self.active_mutation_request = None;
 
                 match result {
+                    Ok(MutationResult::CreateZone {
+                        zone,
+                        zones,
+                        records,
+                        output,
+                        zone_warning,
+                    }) => {
+                        self.zones = zones;
+                        self.zone_state
+                            .select(self.zones.iter().position(|candidate| candidate == &zone));
+                        self.records = records;
+                        self.rebuild_filtered_records();
+                        self.ensure_record_selection();
+                        self.focus = Focus::Records;
+                        self.pending_zone_reload = None;
+                        self.records_loading = false;
+
+                        self.message = Some(self.build_mutation_message(
+                            format!("zone created: {zone}"),
+                            output,
+                            zone_warning,
+                        ));
+                    }
                     Ok(MutationResult::Add {
                         spec,
                         records,
                         output,
                         serial_warning,
+                        zone_warning,
                     }) => {
                         if self.selected_zone() == Some(zone.as_str()) {
                             self.records = records;
@@ -365,7 +446,51 @@ impl DnsPanel {
                                 spec.name, spec.record_type, spec.content
                             ),
                             output,
-                            serial_warning,
+                            combine_optional_warnings([serial_warning, zone_warning]),
+                        ));
+                    }
+                    Ok(MutationResult::Edit {
+                        spec,
+                        replace_spec,
+                        records,
+                        output,
+                        serial_warning,
+                        zone_warning,
+                    }) => {
+                        if self.selected_zone() == Some(zone.as_str()) {
+                            self.records = records;
+                            self.rebuild_filtered_records();
+                            self.ensure_record_selection();
+                        }
+
+                        self.message = Some(self.build_mutation_message(
+                            format!(
+                                "record updated: {} {} {}",
+                                spec.name,
+                                spec.record_type,
+                                replace_spec.contents.join(", ")
+                            ),
+                            output,
+                            combine_optional_warnings([serial_warning, zone_warning]),
+                        ));
+                    }
+                    Ok(MutationResult::RepairSoa {
+                        zone,
+                        records,
+                        output,
+                        serial_warning,
+                        zone_warning,
+                    }) => {
+                        if self.selected_zone() == Some(zone.as_str()) {
+                            self.records = records;
+                            self.rebuild_filtered_records();
+                            self.ensure_record_selection();
+                        }
+
+                        self.message = Some(self.build_mutation_message(
+                            format!("SOA repaired: {zone}"),
+                            output,
+                            combine_optional_warnings([serial_warning, zone_warning]),
                         ));
                     }
                     Ok(MutationResult::Delete {
@@ -373,6 +498,7 @@ impl DnsPanel {
                         records,
                         output,
                         serial_warning,
+                        zone_warning,
                     }) => {
                         if self.selected_zone() == Some(zone.as_str()) {
                             self.records = records;
@@ -386,7 +512,7 @@ impl DnsPanel {
                                 spec.name, spec.record_type, spec.content
                             ),
                             output,
-                            serial_warning,
+                            combine_optional_warnings([serial_warning, zone_warning]),
                         ));
                     }
                     Err(err) => {
@@ -401,7 +527,7 @@ impl DnsPanel {
         &self,
         mut message: String,
         output: Option<String>,
-        serial_warning: Option<String>,
+        warning: Option<String>,
     ) -> FlashMessage {
         if let Some(output) = output {
             if !output.is_empty() {
@@ -410,7 +536,7 @@ impl DnsPanel {
             }
         }
 
-        if let Some(warning) = serial_warning {
+        if let Some(warning) = warning {
             FlashMessage::warning(format!("{message} | {warning}"))
         } else {
             FlashMessage::success(message)
@@ -434,7 +560,10 @@ impl DnsPanel {
         match &self.mode {
             Mode::Browse => {}
             Mode::Filter(state) => self.render_filter_modal(frame, state),
+            Mode::CreateZone(form) => self.render_create_zone_modal(frame, form),
             Mode::Add(form) => self.render_add_modal(frame, form),
+            Mode::Edit(form) => self.render_edit_modal(frame, form),
+            Mode::Soa(dialog) => self.render_soa_modal(frame, dialog),
             Mode::DeleteConfirm(dialog) => self.render_delete_modal(frame, dialog),
         }
     }
@@ -595,7 +724,7 @@ impl DnsPanel {
             Some(message) => (message.kind, message.text.as_str()),
             None => (
                 FlashKind::Info,
-                "j/k move  tab switch  / filter  a add  d delete  r refresh  q quit",
+                "j/k move  tab switch  / filter  z zone  a add  e edit  s soa  d delete  r refresh  q quit",
             ),
         };
 
@@ -707,6 +836,204 @@ impl DnsPanel {
         frame.render_widget(content, area);
     }
 
+    fn render_edit_modal(&self, frame: &mut Frame, form: &EditForm) {
+        let area = centered_rect(72, 48, frame.area());
+        let fields = [
+            (
+                "Content",
+                form.content.as_str(),
+                form.field == EditField::Content,
+            ),
+            ("TTL", form.ttl.as_str(), form.field == EditField::Ttl),
+        ];
+
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("Zone ", Style::default().fg(MUTED)),
+                Span::styled(form.spec.zone.as_str(), Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("Name ", Style::default().fg(MUTED)),
+                Span::styled(form.spec.name.as_str(), Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("Type ", Style::default().fg(MUTED)),
+                Span::styled(
+                    form.spec.record_type.as_str(),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(""),
+        ];
+
+        for (label, value, selected) in fields {
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(BRAND)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(format!("{label:<8}"), Style::default().fg(MUTED)),
+                Span::styled(if value.is_empty() { " " } else { value }, style),
+                Span::styled(if selected { " █" } else { "" }, Style::default().fg(BRAND)),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Edit updates the selected value inside the current rrset. Enter saves. Esc cancels.",
+            Style::default().fg(MUTED),
+        )));
+
+        let content = Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(self.modal_block(" Edit DNS Record "));
+
+        frame.render_widget(Clear, area);
+        frame.render_widget(content, area);
+    }
+
+    fn render_create_zone_modal(&self, frame: &mut Frame, form: &CreateZoneForm) {
+        let area = centered_rect(72, 42, frame.area());
+        let fields = [
+            (
+                "Zone",
+                form.zone.as_str(),
+                form.field == CreateZoneField::Zone,
+            ),
+            (
+                "Primary NS",
+                form.nameserver.as_str(),
+                form.field == CreateZoneField::Nameserver,
+            ),
+        ];
+
+        let mut lines = vec![
+            Line::from(Span::styled(
+                "PowerDNS will create the zone and initialize SOA.",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(Span::styled(
+                "Use a nameserver host like ns1 or ns1.example.com.",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(""),
+        ];
+
+        for (label, value, selected) in fields {
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(BRAND)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(format!("{label:<11}"), Style::default().fg(MUTED)),
+                Span::styled(if value.is_empty() { " " } else { value }, style),
+                Span::styled(if selected { " █" } else { "" }, Style::default().fg(BRAND)),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Tab or arrows move between fields. Enter saves. Esc cancels.",
+            Style::default().fg(MUTED),
+        )));
+
+        let content = Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(self.modal_block(" Create Zone "));
+
+        frame.render_widget(Clear, area);
+        frame.render_widget(content, area);
+    }
+
+    fn render_soa_modal(&self, frame: &mut Frame, dialog: &SoaDialog) {
+        let area = centered_rect(78, 56, frame.area());
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("Zone ", Style::default().fg(MUTED)),
+                Span::styled(dialog.zone.as_str(), Style::default().fg(Color::White)),
+            ]),
+            Line::from(""),
+        ];
+
+        if dialog.inspection.apex_soa.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No apex SOA record found.",
+                Style::default().fg(WARNING),
+            )));
+        } else {
+            for record in &dialog.inspection.apex_soa {
+                lines.push(Line::from(vec![
+                    Span::styled("TTL ", Style::default().fg(MUTED)),
+                    Span::styled(
+                        record
+                            .ttl
+                            .map(|ttl| ttl.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("SOA ", Style::default().fg(MUTED)),
+                    Span::styled(record.content.as_str(), Style::default().fg(Color::White)),
+                ]));
+            }
+        }
+
+        if dialog.inspection.non_apex_soa_count > 0 {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} non-apex SOA record(s) detected.",
+                    dialog.inspection.non_apex_soa_count
+                ),
+                Style::default().fg(WARNING),
+            )));
+        }
+
+        if let Some(warning) = &dialog.inspection.warning {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                warning.as_str(),
+                Style::default().fg(WARNING),
+            )));
+        }
+
+        if let Some(summary) = &dialog.inspection.repair_summary {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                summary.as_str(),
+                Style::default().fg(MUTED),
+            )));
+            lines.push(Line::from(Span::styled(
+                "Enter or r repairs the SOA mailbox. Esc closes.",
+                Style::default().fg(MUTED),
+            )));
+        } else {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Esc closes.",
+                Style::default().fg(MUTED),
+            )));
+        }
+
+        let content = Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(self.modal_block(" SOA Health "));
+
+        frame.render_widget(Clear, area);
+        frame.render_widget(content, area);
+    }
+
     fn render_delete_modal(&self, frame: &mut Frame, dialog: &DeleteDialog) {
         let area = centered_rect(68, 34, frame.area());
         let mut lines = vec![
@@ -771,9 +1098,27 @@ impl DnsPanel {
                 }
                 Ok(false)
             }
+            Mode::CreateZone(mut form) => {
+                if self.handle_create_zone_key(key, &mut form)? {
+                    self.mode = Mode::CreateZone(form);
+                }
+                Ok(false)
+            }
             Mode::Add(mut form) => {
                 if self.handle_add_key(key, &mut form)? {
                     self.mode = Mode::Add(form);
+                }
+                Ok(false)
+            }
+            Mode::Edit(mut form) => {
+                if self.handle_edit_key(key, &mut form)? {
+                    self.mode = Mode::Edit(form);
+                }
+                Ok(false)
+            }
+            Mode::Soa(dialog) => {
+                if self.handle_soa_key(key, &dialog)? {
+                    self.mode = Mode::Soa(dialog);
                 }
                 Ok(false)
             }
@@ -837,6 +1182,46 @@ impl DnsPanel {
                 }
                 Ok(false)
             }
+            KeyCode::Char('e') => {
+                if self.records_loading {
+                    self.message = Some(FlashMessage::warning(
+                        "wait for zone records to finish loading before editing",
+                    ));
+                } else if let Some(record) = self.selected_record() {
+                    if record.record_type.eq_ignore_ascii_case("SOA") {
+                        self.message =
+                            Some(FlashMessage::warning("use `s` to inspect or repair SOA"));
+                    } else {
+                        self.mode = Mode::Edit(EditForm::from_record(
+                            self.selected_zone().unwrap_or_default().to_string(),
+                            record,
+                        ));
+                    }
+                } else {
+                    self.message = Some(FlashMessage::warning("select a record before editing"));
+                }
+                Ok(false)
+            }
+            KeyCode::Char('s') => {
+                if self.records_loading {
+                    self.message = Some(FlashMessage::warning(
+                        "wait for zone records to finish loading before opening SOA health",
+                    ));
+                } else if let Some(zone) = self.selected_zone() {
+                    let inspection = inspect_zone_soa(zone, &self.records);
+                    self.mode = Mode::Soa(SoaDialog {
+                        zone: zone.to_string(),
+                        inspection,
+                    });
+                } else {
+                    self.message = Some(FlashMessage::warning("select a zone first"));
+                }
+                Ok(false)
+            }
+            KeyCode::Char('z') => {
+                self.mode = Mode::CreateZone(CreateZoneForm::default());
+                Ok(false)
+            }
             KeyCode::Char('d') => {
                 if self.records_loading {
                     self.message = Some(FlashMessage::warning(
@@ -886,6 +1271,75 @@ impl DnsPanel {
         }
     }
 
+    fn handle_create_zone_key(
+        &mut self,
+        key: KeyEvent,
+        form: &mut CreateZoneForm,
+    ) -> AppResult<bool> {
+        match key.code {
+            KeyCode::Esc => Ok(false),
+            KeyCode::Enter => {
+                self.submit_create_zone_form(form)?;
+                Ok(false)
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                form.next_field();
+                Ok(true)
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                form.previous_field();
+                Ok(true)
+            }
+            KeyCode::Backspace => {
+                form.active_value_mut().pop();
+                Ok(true)
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                form.active_value_mut().push(ch);
+                Ok(true)
+            }
+            _ => Ok(true),
+        }
+    }
+
+    fn handle_edit_key(&mut self, key: KeyEvent, form: &mut EditForm) -> AppResult<bool> {
+        match key.code {
+            KeyCode::Esc => Ok(false),
+            KeyCode::Enter => {
+                self.submit_edit_form(form)?;
+                Ok(false)
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                form.next_field();
+                Ok(true)
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                form.previous_field();
+                Ok(true)
+            }
+            KeyCode::Backspace => {
+                form.active_value_mut().pop();
+                Ok(true)
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                form.active_value_mut().push(ch);
+                Ok(true)
+            }
+            _ => Ok(true),
+        }
+    }
+
+    fn handle_soa_key(&mut self, key: KeyEvent, dialog: &SoaDialog) -> AppResult<bool> {
+        match key.code {
+            KeyCode::Esc => Ok(false),
+            KeyCode::Enter | KeyCode::Char('r') => {
+                self.submit_soa_repair(dialog)?;
+                Ok(false)
+            }
+            _ => Ok(true),
+        }
+    }
+
     fn handle_add_key(&mut self, key: KeyEvent, form: &mut AddForm) -> AppResult<bool> {
         match key.code {
             KeyCode::Esc => Ok(false),
@@ -927,8 +1381,10 @@ impl DnsPanel {
     fn handle_paste(&mut self, text: &str) {
         match &mut self.mode {
             Mode::Filter(state) => state.value.push_str(text),
+            Mode::CreateZone(form) => form.active_value_mut().push_str(text),
             Mode::Add(form) => form.active_value_mut().push_str(text),
-            Mode::Browse | Mode::DeleteConfirm(_) => {}
+            Mode::Edit(form) => form.active_value_mut().push_str(text),
+            Mode::Browse | Mode::Soa(_) | Mode::DeleteConfirm(_) => {}
         }
     }
 
@@ -1130,6 +1586,202 @@ impl DnsPanel {
         self.records.get(record_index)
     }
 
+    fn submit_edit_form(&mut self, form: &EditForm) -> AppResult<()> {
+        if self.active_mutation_request.is_some() {
+            self.message = Some(FlashMessage::warning(
+                "wait for the current change to finish",
+            ));
+            return Ok(());
+        }
+
+        let runner = self
+            .runner
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| AppError::Message("pdnsutil is unavailable".to_string()))?;
+
+        let ttl = if form.ttl.trim().is_empty() {
+            None
+        } else {
+            Some(parse_ttl(&form.ttl)?)
+        };
+        let new_content =
+            normalize_add_content(&form.spec.record_type, &form.content, &form.spec.zone)?;
+        let replace_spec = build_edit_replace_spec(&self.records, &form.spec, new_content, ttl)?;
+        let zone = form.spec.zone.clone();
+        let spec = form.spec.clone();
+
+        if self.global.dry_run {
+            let output =
+                run_mutation_with_runner(&runner, &runner.replace_rrset_args(&replace_spec))?;
+            let serial_warning = bump_serial_with_runner(&zone, &runner);
+            self.message = Some(self.build_mutation_message(
+                format!("dry run: edit record {}", spec.name),
+                output,
+                serial_warning,
+            ));
+            return Ok(());
+        }
+
+        let request_id = self.next_request_id();
+        self.active_mutation_request = Some(request_id);
+        self.message = Some(FlashMessage::info("updating record..."));
+
+        let background_tx = self.background_tx.clone();
+        thread::spawn(move || {
+            let result = (|| {
+                let output =
+                    run_mutation_with_runner(&runner, &runner.replace_rrset_args(&replace_spec))?;
+                let serial_warning = bump_serial_with_runner(&zone, &runner);
+                let records = verify_rrset_replaced(&runner, &replace_spec)?;
+                let zone_warning = zone_health_warning(&zone, &records);
+                Ok(MutationResult::Edit {
+                    spec,
+                    replace_spec,
+                    records,
+                    output,
+                    serial_warning,
+                    zone_warning,
+                })
+            })();
+
+            let _ = background_tx.send(BackgroundEvent::MutationFinished {
+                request_id,
+                zone,
+                result,
+            });
+        });
+
+        Ok(())
+    }
+
+    fn submit_soa_repair(&mut self, dialog: &SoaDialog) -> AppResult<()> {
+        if self.active_mutation_request.is_some() {
+            self.message = Some(FlashMessage::warning(
+                "wait for the current change to finish",
+            ));
+            return Ok(());
+        }
+
+        let Some(replace_spec) = dialog.inspection.repair_spec.clone() else {
+            self.message = Some(FlashMessage::warning(
+                "no automatic SOA repair is available",
+            ));
+            return Ok(());
+        };
+        let runner = self
+            .runner
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| AppError::Message("pdnsutil is unavailable".to_string()))?;
+        let zone = dialog.zone.clone();
+
+        if self.global.dry_run {
+            let output =
+                run_mutation_with_runner(&runner, &runner.replace_rrset_args(&replace_spec))?;
+            let serial_warning = bump_serial_with_runner(&zone, &runner);
+            self.message = Some(self.build_mutation_message(
+                format!("dry run: repair SOA {}", zone),
+                output,
+                serial_warning,
+            ));
+            return Ok(());
+        }
+
+        let request_id = self.next_request_id();
+        self.active_mutation_request = Some(request_id);
+        self.message = Some(FlashMessage::info("repairing SOA..."));
+
+        let background_tx = self.background_tx.clone();
+        thread::spawn(move || {
+            let result = (|| {
+                let output =
+                    run_mutation_with_runner(&runner, &runner.replace_rrset_args(&replace_spec))?;
+                let serial_warning = bump_serial_with_runner(&zone, &runner);
+                let records = verify_rrset_replaced(&runner, &replace_spec)?;
+                let zone_warning = zone_health_warning(&zone, &records);
+                Ok(MutationResult::RepairSoa {
+                    zone: zone.clone(),
+                    records,
+                    output,
+                    serial_warning,
+                    zone_warning,
+                })
+            })();
+
+            let _ = background_tx.send(BackgroundEvent::MutationFinished {
+                request_id,
+                zone,
+                result,
+            });
+        });
+
+        Ok(())
+    }
+
+    fn submit_create_zone_form(&mut self, form: &CreateZoneForm) -> AppResult<()> {
+        if self.active_mutation_request.is_some() {
+            self.message = Some(FlashMessage::warning(
+                "wait for the current change to finish",
+            ));
+            return Ok(());
+        }
+
+        let runner = self
+            .runner
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| AppError::Message("pdnsutil is unavailable".to_string()))?;
+
+        let spec = match build_create_zone_spec(&runner, &form.zone, &form.nameserver) {
+            Ok(spec) => spec,
+            Err(err) => {
+                self.message = Some(FlashMessage::error(err.to_string()));
+                return Ok(());
+            }
+        };
+        let zone = spec.zone.clone();
+
+        if self.global.dry_run {
+            let output = run_mutation_with_runner(&runner, &runner.create_zone_args(&spec))?;
+            self.message = Some(self.build_mutation_message(
+                format!("dry run: create zone {}", spec.zone),
+                output,
+                None,
+            ));
+            return Ok(());
+        }
+
+        let request_id = self.next_request_id();
+        self.active_mutation_request = Some(request_id);
+        self.message = Some(FlashMessage::info("creating zone..."));
+
+        let background_tx = self.background_tx.clone();
+        thread::spawn(move || {
+            let result = (|| {
+                let output = run_mutation_with_runner(&runner, &runner.create_zone_args(&spec))?;
+                let records = verify_zone_created(&runner, &spec)?;
+                let zones = runner.list_zones()?;
+                let zone_warning = zone_health_warning(&spec.zone, &records);
+                Ok(MutationResult::CreateZone {
+                    zone: spec.zone,
+                    zones,
+                    records,
+                    output,
+                    zone_warning,
+                })
+            })();
+
+            let _ = background_tx.send(BackgroundEvent::MutationFinished {
+                request_id,
+                zone,
+                result,
+            });
+        });
+
+        Ok(())
+    }
+
     fn submit_add_form(&mut self, form: &AddForm) -> AppResult<()> {
         if self.active_mutation_request.is_some() {
             self.message = Some(FlashMessage::warning(
@@ -1194,11 +1846,13 @@ impl DnsPanel {
                 let output = run_mutation_with_runner(&runner, &runner.add_record_args(&spec))?;
                 let serial_warning = bump_serial_with_runner(&zone, &runner);
                 let records = verify_add_record_applied(&runner, &spec)?;
+                let zone_warning = zone_health_warning(&zone, &records);
                 Ok(MutationResult::Add {
                     spec,
                     records,
                     output,
                     serial_warning,
+                    zone_warning,
                 })
             })();
 
@@ -1250,11 +1904,13 @@ impl DnsPanel {
                 let output = run_mutation_with_runner(&runner, &runner.delete_plan_args(&plan))?;
                 let serial_warning = bump_serial_with_runner(&zone, &runner);
                 let records = verify_delete_record_applied(&runner, &spec, &plan)?;
+                let zone_warning = zone_health_warning(&zone, &records);
                 Ok(MutationResult::Delete {
                     spec,
                     records,
                     output,
                     serial_warning,
+                    zone_warning,
                 })
             })();
 
@@ -1306,6 +1962,82 @@ fn bump_serial_with_runner(zone: &str, runner: &PdnsUtil) -> Option<String> {
         Ok(_) if runner.global.dry_run => Some("SOA serial bump planned".to_string()),
         Ok(_) => None,
         Err(err) => Some(format!("failed to increase SOA serial: {err}")),
+    }
+}
+
+fn combine_optional_warnings<const N: usize>(warnings: [Option<String>; N]) -> Option<String> {
+    let combined = warnings
+        .into_iter()
+        .flatten()
+        .filter(|warning| !warning.is_empty())
+        .collect::<Vec<_>>();
+
+    if combined.is_empty() {
+        None
+    } else {
+        Some(combined.join(" | "))
+    }
+}
+
+impl CreateZoneForm {
+    fn default() -> Self {
+        Self {
+            zone: String::new(),
+            nameserver: "ns1".to_string(),
+            field: CreateZoneField::Zone,
+        }
+    }
+
+    fn next_field(&mut self) {
+        self.field = match self.field {
+            CreateZoneField::Zone => CreateZoneField::Nameserver,
+            CreateZoneField::Nameserver => CreateZoneField::Zone,
+        };
+    }
+
+    fn previous_field(&mut self) {
+        self.next_field();
+    }
+
+    fn active_value_mut(&mut self) -> &mut String {
+        match self.field {
+            CreateZoneField::Zone => &mut self.zone,
+            CreateZoneField::Nameserver => &mut self.nameserver,
+        }
+    }
+}
+
+impl EditForm {
+    fn from_record(zone: String, record: &ZoneRecord) -> Self {
+        Self {
+            spec: DeleteRecordSpec {
+                zone,
+                name: record.name.clone(),
+                record_type: record.record_type.clone(),
+                content: record.content.clone(),
+            },
+            content: record.content.clone(),
+            ttl: record.ttl.map(|ttl| ttl.to_string()).unwrap_or_default(),
+            field: EditField::Content,
+        }
+    }
+
+    fn next_field(&mut self) {
+        self.field = match self.field {
+            EditField::Content => EditField::Ttl,
+            EditField::Ttl => EditField::Content,
+        };
+    }
+
+    fn previous_field(&mut self) {
+        self.next_field();
+    }
+
+    fn active_value_mut(&mut self) -> &mut String {
+        match self.field {
+            EditField::Content => &mut self.content,
+            EditField::Ttl => &mut self.ttl,
+        }
     }
 }
 

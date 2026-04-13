@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0-alpha.7] - 2026-04-13
+
+### Added
+
+- Added TUI zone creation on `z`, with post-create zone verification and automatic focus on the new zone's records view.
+- Added TUI record editing on `e` for updating the selected record content and TTL through verified rrset replacement.
+- Added a TUI SOA health panel on `s`, including warnings for missing or malformed SOA state and a safe mailbox rewrite repair when possible.
+
+### Changed
+
+- Kept zone creation as a TUI-first workflow instead of exposing a separate `create zone` CLI command.
+
+### Fixed
+
+- Reused the verified rrset replacement path for edit and SOA repair flows so legacy PowerDNS `4.8.x` remains on the compatibility-tested command path.
+
 ## [1.1.0-alpha.6] - 2026-04-12
 
 ### Fixed
