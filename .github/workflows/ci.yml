@@ -3,7 +3,9 @@ name: ci
 on:
   push:
     branches:
-      - main
+      - "**"
+    tags-ignore:
+      - "v*"
   pull_request:
 
 env:
@@ -28,3 +30,37 @@ jobs:
 
       - name: Run tests
         run: cargo test
+
+  build-branch-artifact:
+    if: github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: bash scripts/install-rust-toolchain.sh stable x86_64-unknown-linux-musl
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Build release binary
+        run: cargo zigbuild --release --target x86_64-unknown-linux-musl
+
+      - name: Package artifact
+        run: SKIP_BUILD=1 bash scripts/package-release.sh x86_64-unknown-linux-musl
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppdns-${{ github.ref_name }}-x86_64-unknown-linux-musl
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256

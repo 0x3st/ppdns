@@ -175,6 +175,18 @@ struct SoaInspection {
     repair_summary: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SoaEditInput {
+    primary_nameserver: String,
+    mailbox: String,
+    serial: String,
+    refresh: String,
+    retry: String,
+    expire: String,
+    minimum: String,
+    ttl: String,
+}
+
 #[derive(Debug, Clone)]
 enum DeleteMethod {
     DeleteRrset,
@@ -682,6 +694,39 @@ impl PdnsUtil {
 
         if let Some(config_name) = &self.global.config_name {
             command.arg("--config-name").arg(config_name);
+        }
+    }
+}
+
+impl SoaEditInput {
+    fn from_apex_soa(apex_soa: &[ZoneRecord]) -> Self {
+        let Some(record) = apex_soa.first() else {
+            return Self::default();
+        };
+        let tokens = soa_content_tokens(&record.content).unwrap_or_default();
+
+        Self {
+            primary_nameserver: tokens.first().cloned().unwrap_or_default(),
+            mailbox: tokens.get(1).cloned().unwrap_or_default(),
+            serial: tokens.get(2).cloned().unwrap_or_default(),
+            refresh: tokens.get(3).cloned().unwrap_or_default(),
+            retry: tokens.get(4).cloned().unwrap_or_default(),
+            expire: tokens.get(5).cloned().unwrap_or_default(),
+            minimum: tokens.get(6).cloned().unwrap_or_default(),
+            ttl: record.ttl.map(|ttl| ttl.to_string()).unwrap_or_default(),
+        }
+    }
+
+    fn default_for_zone(zone: &str, primary_nameserver: &str) -> Self {
+        Self {
+            primary_nameserver: primary_nameserver.to_string(),
+            mailbox: format!("hostmaster@{}", zone.trim_end_matches('.')),
+            serial: "1".to_string(),
+            refresh: "3600".to_string(),
+            retry: "600".to_string(),
+            expire: "1209600".to_string(),
+            minimum: "300".to_string(),
+            ttl: "300".to_string(),
         }
     }
 }
@@ -1316,6 +1361,31 @@ fn build_edit_replace_spec(
     })
 }
 
+fn build_soa_edit_replace_spec(zone: &str, input: &SoaEditInput) -> AppResult<ReplaceRrsetSpec> {
+    let primary_nameserver = normalize_soa_primary_nameserver(&input.primary_nameserver, zone)?;
+    let mailbox = normalize_soa_mailbox_input(&input.mailbox, zone)?;
+    let serial = parse_soa_number("serial", &input.serial)?;
+    let refresh = parse_soa_number("refresh", &input.refresh)?;
+    let retry = parse_soa_number("retry", &input.retry)?;
+    let expire = parse_soa_number("expire", &input.expire)?;
+    let minimum = parse_soa_number("minimum", &input.minimum)?;
+    let ttl = if input.ttl.trim().is_empty() {
+        None
+    } else {
+        Some(parse_ttl(&input.ttl)?)
+    };
+
+    Ok(ReplaceRrsetSpec {
+        zone: zone.to_string(),
+        name: zone.to_string(),
+        record_type: "SOA".to_string(),
+        ttl,
+        contents: vec![format!(
+            "{primary_nameserver} {mailbox} {serial} {refresh} {retry} {expire} {minimum}"
+        )],
+    })
+}
+
 fn build_soa_repair_spec(zone: &str, apex_soa: &[ZoneRecord]) -> Option<ReplaceRrsetSpec> {
     if apex_soa.len() != 1 {
         return None;
@@ -1367,6 +1437,43 @@ fn normalize_soa_mailbox(value: &str) -> Option<String> {
         "{escaped_local}.{}",
         normalize_zone_name(domain_part)
     ))
+}
+
+fn normalize_soa_primary_nameserver(value: &str, zone: &str) -> AppResult<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Message(
+            "SOA primary nameserver is required".to_string(),
+        ));
+    }
+
+    Ok(normalize_target_name(trimmed, zone))
+}
+
+fn normalize_soa_mailbox_input(value: &str, zone: &str) -> AppResult<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Message("SOA mailbox is required".to_string()));
+    }
+
+    if trimmed.contains('@') {
+        normalize_soa_mailbox(trimmed)
+            .ok_or_else(|| AppError::Message(format!("invalid SOA mailbox: `{value}`")))
+    } else {
+        Ok(normalize_target_name(trimmed, zone))
+    }
+}
+
+fn parse_soa_number(label: &str, value: &str) -> AppResult<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Message(format!("SOA {label} is required")));
+    }
+
+    trimmed
+        .parse::<u32>()
+        .map(|_| trimmed.to_string())
+        .map_err(|_| AppError::Message(format!("invalid SOA {label}: `{value}`")))
 }
 
 fn legacy_owner_name_arg(zone: &str, name: &str) -> String {
@@ -3271,6 +3378,99 @@ mod tests {
             spec.contents,
             vec!["ns1.example.com. hostmaster.example.com. 1 3600 600 1209600 300".to_string()]
         );
+    }
+
+    #[test]
+    fn soa_edit_input_prefills_from_existing_record() {
+        let apex_soa = vec![ZoneRecord {
+            name: "example.com.".to_string(),
+            ttl: Some(600),
+            record_type: "SOA".to_string(),
+            content: "ns1.example.com. hostmaster.example.com. 2026041301 3600 600 1209600 300"
+                .to_string(),
+        }];
+
+        assert_eq!(
+            SoaEditInput::from_apex_soa(&apex_soa),
+            SoaEditInput {
+                primary_nameserver: "ns1.example.com.".to_string(),
+                mailbox: "hostmaster.example.com.".to_string(),
+                serial: "2026041301".to_string(),
+                refresh: "3600".to_string(),
+                retry: "600".to_string(),
+                expire: "1209600".to_string(),
+                minimum: "300".to_string(),
+                ttl: "600".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn soa_edit_spec_normalizes_mailbox_and_nameserver() {
+        let input = SoaEditInput {
+            primary_nameserver: "ns1".to_string(),
+            mailbox: "host.master@example.com".to_string(),
+            serial: "2026041301".to_string(),
+            refresh: "3600".to_string(),
+            retry: "600".to_string(),
+            expire: "1209600".to_string(),
+            minimum: "300".to_string(),
+            ttl: "600".to_string(),
+        };
+
+        let spec = build_soa_edit_replace_spec("example.com.", &input)
+            .expect("SOA edit spec should build");
+
+        assert_eq!(spec.ttl, Some(600));
+        assert_eq!(
+            spec.contents,
+            vec![
+                "ns1.example.com. host\\.master.example.com. 2026041301 3600 600 1209600 300"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn soa_edit_spec_accepts_rfc_style_mailbox() {
+        let input = SoaEditInput {
+            primary_nameserver: "ns1.example.com.".to_string(),
+            mailbox: "hostmaster.example.com".to_string(),
+            serial: "1".to_string(),
+            refresh: "3600".to_string(),
+            retry: "600".to_string(),
+            expire: "1209600".to_string(),
+            minimum: "300".to_string(),
+            ttl: String::new(),
+        };
+
+        let spec = build_soa_edit_replace_spec("example.com.", &input)
+            .expect("SOA edit spec should build");
+
+        assert_eq!(
+            spec.contents,
+            vec!["ns1.example.com. hostmaster.example.com. 1 3600 600 1209600 300".to_string()]
+        );
+        assert_eq!(spec.ttl, None);
+    }
+
+    #[test]
+    fn soa_edit_spec_requires_numeric_serial() {
+        let input = SoaEditInput {
+            primary_nameserver: "ns1.example.com.".to_string(),
+            mailbox: "hostmaster.example.com.".to_string(),
+            serial: "abc".to_string(),
+            refresh: "3600".to_string(),
+            retry: "600".to_string(),
+            expire: "1209600".to_string(),
+            minimum: "300".to_string(),
+            ttl: "300".to_string(),
+        };
+
+        let err = build_soa_edit_replace_spec("example.com.", &input)
+            .expect_err("invalid serial should fail");
+
+        assert_eq!(err.to_string(), "invalid SOA serial: `abc`");
     }
 
     #[test]
