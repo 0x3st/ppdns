@@ -1369,11 +1369,11 @@ fn build_soa_edit_replace_spec(zone: &str, input: &SoaEditInput) -> AppResult<Re
     let retry = parse_soa_number("retry", &input.retry)?;
     let expire = parse_soa_number("expire", &input.expire)?;
     let minimum = parse_soa_number("minimum", &input.minimum)?;
-    let ttl = if input.ttl.trim().is_empty() {
-        None
-    } else {
-        Some(parse_ttl(&input.ttl)?)
-    };
+    let ttl_input = input.ttl.trim();
+    if ttl_input.is_empty() {
+        return Err(AppError::Message("SOA TTL is required".to_string()));
+    }
+    let ttl = Some(parse_ttl(ttl_input)?);
 
     Ok(ReplaceRrsetSpec {
         zone: zone.to_string(),
@@ -3441,7 +3441,7 @@ mod tests {
             retry: "600".to_string(),
             expire: "1209600".to_string(),
             minimum: "300".to_string(),
-            ttl: String::new(),
+            ttl: "300".to_string(),
         };
 
         let spec = build_soa_edit_replace_spec("example.com.", &input)
@@ -3451,7 +3451,26 @@ mod tests {
             spec.contents,
             vec!["ns1.example.com. hostmaster.example.com. 1 3600 600 1209600 300".to_string()]
         );
-        assert_eq!(spec.ttl, None);
+        assert_eq!(spec.ttl, Some(300));
+    }
+
+    #[test]
+    fn soa_edit_spec_requires_ttl() {
+        let input = SoaEditInput {
+            primary_nameserver: "ns1.example.com.".to_string(),
+            mailbox: "hostmaster.example.com.".to_string(),
+            serial: "1".to_string(),
+            refresh: "3600".to_string(),
+            retry: "600".to_string(),
+            expire: "1209600".to_string(),
+            minimum: "300".to_string(),
+            ttl: String::new(),
+        };
+
+        let err = build_soa_edit_replace_spec("example.com.", &input)
+            .expect_err("missing ttl should fail");
+
+        assert_eq!(err.to_string(), "SOA TTL is required");
     }
 
     #[test]

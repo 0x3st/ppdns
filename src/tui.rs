@@ -2040,17 +2040,22 @@ impl DnsPanel {
             .as_ref()
             .cloned()
             .ok_or_else(|| AppError::Message("pdnsutil is unavailable".to_string()))?;
-        let replace_spec = build_soa_edit_replace_spec(&form.zone, &form.input)?;
+        let replace_spec = match build_soa_edit_replace_spec(&form.zone, &form.input) {
+            Ok(spec) => spec,
+            Err(err) => {
+                self.message = Some(FlashMessage::error(err.to_string()));
+                return Ok(());
+            }
+        };
         let zone = form.zone.clone();
 
         if self.global.dry_run {
             let output =
                 run_mutation_with_runner(&runner, &runner.replace_rrset_args(&replace_spec))?;
-            let serial_warning = bump_serial_with_runner(&zone, &runner);
             self.message = Some(self.build_mutation_message(
                 format!("dry run: edit SOA {}", zone),
                 output,
-                serial_warning,
+                None,
             ));
             return Ok(());
         }
@@ -2064,14 +2069,13 @@ impl DnsPanel {
             let result = (|| {
                 let output =
                     run_mutation_with_runner(&runner, &runner.replace_rrset_args(&replace_spec))?;
-                let serial_warning = bump_serial_with_runner(&zone, &runner);
                 let records = verify_rrset_replaced(&runner, &replace_spec)?;
                 let zone_warning = zone_health_warning(&zone, &records);
                 Ok(MutationResult::EditSoa {
                     zone: zone.clone(),
                     records,
                     output,
-                    serial_warning,
+                    serial_warning: None,
                     zone_warning,
                 })
             })();
@@ -2999,4 +3003,69 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dry_run_panel(syntax: PdnsSyntax) -> DnsPanel {
+        let global = GlobalOptions {
+            dry_run: true,
+            ..GlobalOptions::default()
+        };
+        let runner = PdnsUtil {
+            global: global.clone(),
+            syntax,
+        };
+        let mut panel = DnsPanel::new(global);
+        panel.runner = Some(runner);
+        panel
+    }
+
+    fn soa_edit_form(ttl: &str) -> SoaEditForm {
+        SoaEditForm {
+            zone: "example.com.".to_string(),
+            input: SoaEditInput {
+                primary_nameserver: "ns1.example.com.".to_string(),
+                mailbox: "hostmaster.example.com.".to_string(),
+                serial: "2026041401".to_string(),
+                refresh: "3600".to_string(),
+                retry: "600".to_string(),
+                expire: "1209600".to_string(),
+                minimum: "300".to_string(),
+                ttl: ttl.to_string(),
+            },
+            field: SoaEditField::PrimaryNameserver,
+            note: None,
+            cursor: 0,
+        }
+    }
+
+    #[test]
+    fn dry_run_soa_edit_does_not_plan_serial_bump() {
+        let mut panel = dry_run_panel(PdnsSyntax::Legacy);
+
+        panel
+            .submit_soa_edit_form(&soa_edit_form("300"))
+            .expect("SOA edit should succeed");
+
+        let message = panel.message.expect("expected flash message");
+        assert!(message.text.contains("dry run: edit SOA example.com."));
+        assert!(message.text.contains("replace-rrset"));
+        assert!(!message.text.contains("SOA serial bump planned"));
+    }
+
+    #[test]
+    fn soa_edit_validation_errors_stay_in_tui() {
+        let mut panel = dry_run_panel(PdnsSyntax::Legacy);
+
+        panel
+            .submit_soa_edit_form(&soa_edit_form(""))
+            .expect("validation errors should not exit the TUI");
+
+        let message = panel.message.expect("expected flash message");
+        assert_eq!(message.text, "SOA TTL is required");
+        assert!(matches!(message.kind, FlashKind::Error));
+    }
 }
