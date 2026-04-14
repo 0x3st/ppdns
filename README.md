@@ -12,9 +12,14 @@ It wraps `pdnsutil` and focuses on the common workflow that operators use most o
 
 The main goal is to lower the learning cost of `pdnsutil` by giving you an interactive panel instead of asking you to remember the full command syntax.
 
+## Acknowledgements
+
+- Thanks to [PowerDNS](https://www.powerdns.com/) for the software that `ppdns` builds on top of.
+- Thanks to [LINUX DO](https://linux.do/) for the promotion opportunity and community exposure.
+
 ## Features
 
-- Full-screen TUI: run `ppdns` to open a Cloudflare-style DNS panel in the terminal.
+- Full-screen TUI: run `ppdns` to open a lean DNS panel in the terminal.
 - TUI zone creation: press `z` in the panel to create a zone with one primary NS and then replace the default SOA with ppdns-managed values.
 - TUI record editing: press `e` on a selected record to update its content or TTL inside the current RRset.
 - TUI SOA editing: press `s`, then `e`, to edit SOA primary NS, mailbox, serial, refresh, retry, expire, minimum, and TTL in one form.
@@ -39,13 +44,13 @@ curl -fsSL https://raw.githubusercontent.com/0x3st/ppdns/main/scripts/install.sh
 Install a specific version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/0x3st/ppdns/main/scripts/install.sh | sh -s -- --version 1.0.2
+curl -fsSL https://raw.githubusercontent.com/0x3st/ppdns/main/scripts/install.sh | sh -s -- --version 1.1.0
 ```
 
 Install an alpha or other prerelease:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/0x3st/ppdns/main/scripts/install.sh | sh -s -- --version 1.1.0-alpha.1
+curl -fsSL https://raw.githubusercontent.com/0x3st/ppdns/main/scripts/install.sh | sh -s -- --version 1.1.0-alpha.7
 ```
 
 Install to a custom directory:
