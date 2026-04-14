@@ -101,11 +101,13 @@ enum Mode {
     Add(AddForm),
     Edit(EditForm),
     Soa(SoaDialog),
+    SoaEdit(SoaEditForm),
     DeleteConfirm(DeleteDialog),
 }
 
 struct FilterState {
     value: String,
+    cursor: usize,
 }
 
 struct AddForm {
@@ -114,6 +116,7 @@ struct AddForm {
     content: String,
     ttl: String,
     field: AddField,
+    cursor: usize,
 }
 
 struct EditForm {
@@ -121,12 +124,14 @@ struct EditForm {
     content: String,
     ttl: String,
     field: EditField,
+    cursor: usize,
 }
 
 struct CreateZoneForm {
     zone: String,
     nameserver: String,
     field: CreateZoneField,
+    cursor: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -138,6 +143,18 @@ enum CreateZoneField {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EditField {
     Content,
+    Ttl,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SoaEditField {
+    PrimaryNameserver,
+    Mailbox,
+    Serial,
+    Refresh,
+    Retry,
+    Expire,
+    Minimum,
     Ttl,
 }
 
@@ -159,6 +176,14 @@ struct SoaDialog {
     inspection: SoaInspection,
 }
 
+struct SoaEditForm {
+    zone: String,
+    input: SoaEditInput,
+    field: SoaEditField,
+    note: Option<String>,
+    cursor: usize,
+}
+
 struct PendingZoneReload {
     ready_at: Instant,
     clear_records: bool,
@@ -167,6 +192,7 @@ struct PendingZoneReload {
 struct FlashMessage {
     kind: FlashKind,
     text: String,
+    expires_at: Instant,
 }
 
 enum BackgroundEvent {
@@ -200,6 +226,13 @@ enum MutationResult {
     Edit {
         spec: DeleteRecordSpec,
         replace_spec: ReplaceRrsetSpec,
+        records: Vec<ZoneRecord>,
+        output: Option<String>,
+        serial_warning: Option<String>,
+        zone_warning: Option<String>,
+    },
+    EditSoa {
+        zone: String,
         records: Vec<ZoneRecord>,
         output: Option<String>,
         serial_warning: Option<String>,
@@ -269,6 +302,10 @@ impl DnsPanel {
                 needs_draw = true;
             }
 
+            if self.clear_expired_message() {
+                needs_draw = true;
+            }
+
             if needs_draw {
                 terminal.draw(|frame| self.draw(frame))?;
                 needs_draw = false;
@@ -308,6 +345,20 @@ impl DnsPanel {
                 }
                 _ => {}
             }
+        }
+    }
+
+    fn clear_expired_message(&mut self) -> bool {
+        let expired = self
+            .message
+            .as_ref()
+            .is_some_and(|message| Instant::now() >= message.expires_at);
+
+        if expired {
+            self.message = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -474,6 +525,25 @@ impl DnsPanel {
                             combine_optional_warnings([serial_warning, zone_warning]),
                         ));
                     }
+                    Ok(MutationResult::EditSoa {
+                        zone,
+                        records,
+                        output,
+                        serial_warning,
+                        zone_warning,
+                    }) => {
+                        if self.selected_zone() == Some(zone.as_str()) {
+                            self.records = records;
+                            self.rebuild_filtered_records();
+                            self.ensure_record_selection();
+                        }
+
+                        self.message = Some(self.build_mutation_message(
+                            format!("SOA updated: {zone}"),
+                            output,
+                            combine_optional_warnings([serial_warning, zone_warning]),
+                        ));
+                    }
                     Ok(MutationResult::RepairSoa {
                         zone,
                         records,
@@ -564,6 +634,7 @@ impl DnsPanel {
             Mode::Add(form) => self.render_add_modal(frame, form),
             Mode::Edit(form) => self.render_edit_modal(frame, form),
             Mode::Soa(dialog) => self.render_soa_modal(frame, dialog),
+            Mode::SoaEdit(form) => self.render_soa_edit_modal(frame, form),
             Mode::DeleteConfirm(dialog) => self.render_delete_modal(frame, dialog),
         }
     }
@@ -758,11 +829,12 @@ impl DnsPanel {
                 Style::default().fg(MUTED),
             )),
             Line::from(""),
-            Line::from(vec![
-                Span::styled("Filter: ", Style::default().fg(BRAND)),
-                Span::styled(state.value.clone(), Style::default().fg(Color::White)),
-                Span::styled("█", Style::default().fg(BRAND)),
-            ]),
+            input_line(
+                "Filter: ".to_string(),
+                Style::default().fg(BRAND),
+                state.value.as_str(),
+                Some(state.cursor),
+            ),
             Line::from(""),
             Line::from(Span::styled(
                 "Enter apply   Esc cancel",
@@ -806,20 +878,16 @@ impl DnsPanel {
         ];
 
         for (label, value, selected) in fields {
-            let style = if selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(BRAND)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(format!("{label:<8}"), Style::default().fg(MUTED)),
-                Span::styled(if value.is_empty() { " " } else { value }, style),
-                Span::styled(if selected { " █" } else { "" }, Style::default().fg(BRAND)),
-            ]));
+            lines.push(input_line(
+                format!("{label:<8}"),
+                if selected {
+                    Style::default().fg(BRAND).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED)
+                },
+                value,
+                selected.then_some(form.cursor),
+            ));
         }
 
         lines.push(Line::from(""));
@@ -867,20 +935,16 @@ impl DnsPanel {
         ];
 
         for (label, value, selected) in fields {
-            let style = if selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(BRAND)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(format!("{label:<8}"), Style::default().fg(MUTED)),
-                Span::styled(if value.is_empty() { " " } else { value }, style),
-                Span::styled(if selected { " █" } else { "" }, Style::default().fg(BRAND)),
-            ]));
+            lines.push(input_line(
+                format!("{label:<8}"),
+                if selected {
+                    Style::default().fg(BRAND).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED)
+                },
+                value,
+                selected.then_some(form.cursor),
+            ));
         }
 
         lines.push(Line::from(""));
@@ -914,31 +978,31 @@ impl DnsPanel {
 
         let mut lines = vec![
             Line::from(Span::styled(
-                "PowerDNS will create the zone and initialize SOA.",
+                "ppdns will create the zone and replace the default SOA.",
                 Style::default().fg(MUTED),
             )),
             Line::from(Span::styled(
                 "Use a nameserver host like ns1 or ns1.example.com.",
                 Style::default().fg(MUTED),
             )),
+            Line::from(Span::styled(
+                "The initial mailbox is hostmaster@<zone>; you can refine it in the SOA editor.",
+                Style::default().fg(MUTED),
+            )),
             Line::from(""),
         ];
 
         for (label, value, selected) in fields {
-            let style = if selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(BRAND)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(format!("{label:<11}"), Style::default().fg(MUTED)),
-                Span::styled(if value.is_empty() { " " } else { value }, style),
-                Span::styled(if selected { " █" } else { "" }, Style::default().fg(BRAND)),
-            ]));
+            lines.push(input_line(
+                format!("{label:<11}"),
+                if selected {
+                    Style::default().fg(BRAND).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED)
+                },
+                value,
+                selected.then_some(form.cursor),
+            ));
         }
 
         lines.push(Line::from(""));
@@ -1014,21 +1078,113 @@ impl DnsPanel {
                 summary.as_str(),
                 Style::default().fg(MUTED),
             )));
-            lines.push(Line::from(Span::styled(
-                "Enter or r repairs the SOA mailbox. Esc closes.",
-                Style::default().fg(MUTED),
-            )));
-        } else {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "Esc closes.",
-                Style::default().fg(MUTED),
-            )));
         }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            if dialog.inspection.repair_summary.is_some() {
+                "e edits SOA fields. Enter or r repairs mailbox. Esc closes."
+            } else {
+                "e edits SOA fields. Esc closes."
+            },
+            Style::default().fg(MUTED),
+        )));
 
         let content = Paragraph::new(lines)
             .wrap(Wrap { trim: true })
             .block(self.modal_block(" SOA Health "));
+
+        frame.render_widget(Clear, area);
+        frame.render_widget(content, area);
+    }
+
+    fn render_soa_edit_modal(&self, frame: &mut Frame, form: &SoaEditForm) {
+        let area = centered_rect(82, 70, frame.area());
+        let fields = [
+            (
+                "Primary NS",
+                form.input.primary_nameserver.as_str(),
+                form.field == SoaEditField::PrimaryNameserver,
+            ),
+            (
+                "Mailbox",
+                form.input.mailbox.as_str(),
+                form.field == SoaEditField::Mailbox,
+            ),
+            (
+                "Serial",
+                form.input.serial.as_str(),
+                form.field == SoaEditField::Serial,
+            ),
+            (
+                "Refresh",
+                form.input.refresh.as_str(),
+                form.field == SoaEditField::Refresh,
+            ),
+            (
+                "Retry",
+                form.input.retry.as_str(),
+                form.field == SoaEditField::Retry,
+            ),
+            (
+                "Expire",
+                form.input.expire.as_str(),
+                form.field == SoaEditField::Expire,
+            ),
+            (
+                "Minimum",
+                form.input.minimum.as_str(),
+                form.field == SoaEditField::Minimum,
+            ),
+            (
+                "TTL",
+                form.input.ttl.as_str(),
+                form.field == SoaEditField::Ttl,
+            ),
+        ];
+
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("Zone ", Style::default().fg(MUTED)),
+                Span::styled(form.zone.as_str(), Style::default().fg(Color::White)),
+            ]),
+            Line::from(Span::styled(
+                "Mailbox accepts hostmaster@example.com or hostmaster.example.com.",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(""),
+        ];
+
+        if let Some(note) = &form.note {
+            lines.push(Line::from(Span::styled(
+                note.as_str(),
+                Style::default().fg(WARNING),
+            )));
+            lines.push(Line::from(""));
+        }
+
+        for (label, value, selected) in fields {
+            lines.push(input_line(
+                format!("{label:<11}"),
+                if selected {
+                    Style::default().fg(BRAND).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED)
+                },
+                value,
+                selected.then_some(form.cursor),
+            ));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Tab or arrows move between fields. Enter saves. Esc returns.",
+            Style::default().fg(MUTED),
+        )));
+
+        let content = Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(self.modal_block(" Edit SOA "));
 
         frame.render_widget(Clear, area);
         frame.render_widget(content, area);
@@ -1122,6 +1278,12 @@ impl DnsPanel {
                 }
                 Ok(false)
             }
+            Mode::SoaEdit(mut form) => {
+                if self.handle_soa_edit_key(key, &mut form)? {
+                    self.mode = Mode::SoaEdit(form);
+                }
+                Ok(false)
+            }
             Mode::DeleteConfirm(dialog) => {
                 if self.handle_delete_key(key, &dialog)? {
                     self.mode = Mode::DeleteConfirm(dialog);
@@ -1159,6 +1321,7 @@ impl DnsPanel {
             KeyCode::Char('/') => {
                 self.mode = Mode::Filter(FilterState {
                     value: self.filter.clone(),
+                    cursor: self.filter.chars().count(),
                 });
                 Ok(false)
             }
@@ -1187,15 +1350,21 @@ impl DnsPanel {
                     self.message = Some(FlashMessage::warning(
                         "wait for zone records to finish loading before editing",
                     ));
-                } else if let Some(record) = self.selected_record() {
+                } else if let Some(record) = self.selected_record().cloned() {
+                    let zone = self.selected_zone().unwrap_or_default().to_string();
                     if record.record_type.eq_ignore_ascii_case("SOA") {
-                        self.message =
-                            Some(FlashMessage::warning("use `s` to inspect or repair SOA"));
+                        let dialog = SoaDialog {
+                            zone: zone.clone(),
+                            inspection: inspect_zone_soa(&zone, &self.records),
+                        };
+
+                        if record.name == zone {
+                            self.mode = Mode::SoaEdit(SoaEditForm::from_dialog(&dialog));
+                        } else {
+                            self.mode = Mode::Soa(dialog);
+                        }
                     } else {
-                        self.mode = Mode::Edit(EditForm::from_record(
-                            self.selected_zone().unwrap_or_default().to_string(),
-                            record,
-                        ));
+                        self.mode = Mode::Edit(EditForm::from_record(zone, &record));
                     }
                 } else {
                     self.message = Some(FlashMessage::warning("select a record before editing"));
@@ -1259,12 +1428,32 @@ impl DnsPanel {
                 }));
                 false
             }
+            KeyCode::Left => {
+                state.move_cursor_left();
+                true
+            }
+            KeyCode::Right => {
+                state.move_cursor_right();
+                true
+            }
+            KeyCode::Home => {
+                state.cursor = 0;
+                true
+            }
+            KeyCode::End => {
+                state.cursor = value_char_len(&state.value);
+                true
+            }
             KeyCode::Backspace => {
-                state.value.pop();
+                state.backspace();
+                true
+            }
+            KeyCode::Delete => {
+                state.delete();
                 true
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                state.value.push(ch);
+                state.insert_char(ch);
                 true
             }
             _ => true,
@@ -1290,12 +1479,32 @@ impl DnsPanel {
                 form.previous_field();
                 Ok(true)
             }
+            KeyCode::Left => {
+                form.move_cursor_left();
+                Ok(true)
+            }
+            KeyCode::Right => {
+                form.move_cursor_right();
+                Ok(true)
+            }
+            KeyCode::Home => {
+                form.cursor = 0;
+                Ok(true)
+            }
+            KeyCode::End => {
+                form.cursor = value_char_len(form.active_value());
+                Ok(true)
+            }
             KeyCode::Backspace => {
-                form.active_value_mut().pop();
+                form.backspace();
+                Ok(true)
+            }
+            KeyCode::Delete => {
+                form.delete();
                 Ok(true)
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                form.active_value_mut().push(ch);
+                form.insert_char(ch);
                 Ok(true)
             }
             _ => Ok(true),
@@ -1317,12 +1526,32 @@ impl DnsPanel {
                 form.previous_field();
                 Ok(true)
             }
+            KeyCode::Left => {
+                form.move_cursor_left();
+                Ok(true)
+            }
+            KeyCode::Right => {
+                form.move_cursor_right();
+                Ok(true)
+            }
+            KeyCode::Home => {
+                form.cursor = 0;
+                Ok(true)
+            }
+            KeyCode::End => {
+                form.cursor = value_char_len(form.active_value());
+                Ok(true)
+            }
             KeyCode::Backspace => {
-                form.active_value_mut().pop();
+                form.backspace();
+                Ok(true)
+            }
+            KeyCode::Delete => {
+                form.delete();
                 Ok(true)
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                form.active_value_mut().push(ch);
+                form.insert_char(ch);
                 Ok(true)
             }
             _ => Ok(true),
@@ -1332,9 +1561,67 @@ impl DnsPanel {
     fn handle_soa_key(&mut self, key: KeyEvent, dialog: &SoaDialog) -> AppResult<bool> {
         match key.code {
             KeyCode::Esc => Ok(false),
+            KeyCode::Char('e') => {
+                self.mode = Mode::SoaEdit(SoaEditForm::from_dialog(dialog));
+                Ok(false)
+            }
             KeyCode::Enter | KeyCode::Char('r') => {
                 self.submit_soa_repair(dialog)?;
                 Ok(false)
+            }
+            _ => Ok(true),
+        }
+    }
+
+    fn handle_soa_edit_key(&mut self, key: KeyEvent, form: &mut SoaEditForm) -> AppResult<bool> {
+        match key.code {
+            KeyCode::Esc => {
+                let inspection = inspect_zone_soa(&form.zone, &self.records);
+                self.mode = Mode::Soa(SoaDialog {
+                    zone: form.zone.clone(),
+                    inspection,
+                });
+                Ok(false)
+            }
+            KeyCode::Enter => {
+                self.submit_soa_edit_form(form)?;
+                Ok(false)
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                form.next_field();
+                Ok(true)
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                form.previous_field();
+                Ok(true)
+            }
+            KeyCode::Left => {
+                form.move_cursor_left();
+                Ok(true)
+            }
+            KeyCode::Right => {
+                form.move_cursor_right();
+                Ok(true)
+            }
+            KeyCode::Home => {
+                form.cursor = 0;
+                Ok(true)
+            }
+            KeyCode::End => {
+                form.cursor = value_char_len(form.active_value());
+                Ok(true)
+            }
+            KeyCode::Backspace => {
+                form.backspace();
+                Ok(true)
+            }
+            KeyCode::Delete => {
+                form.delete();
+                Ok(true)
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                form.insert_char(ch);
+                Ok(true)
             }
             _ => Ok(true),
         }
@@ -1355,12 +1642,32 @@ impl DnsPanel {
                 form.previous_field();
                 Ok(true)
             }
+            KeyCode::Left => {
+                form.move_cursor_left();
+                Ok(true)
+            }
+            KeyCode::Right => {
+                form.move_cursor_right();
+                Ok(true)
+            }
+            KeyCode::Home => {
+                form.cursor = 0;
+                Ok(true)
+            }
+            KeyCode::End => {
+                form.cursor = value_char_len(form.active_value());
+                Ok(true)
+            }
             KeyCode::Backspace => {
-                form.active_value_mut().pop();
+                form.backspace();
+                Ok(true)
+            }
+            KeyCode::Delete => {
+                form.delete();
                 Ok(true)
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                form.active_value_mut().push(ch);
+                form.insert_char(ch);
                 Ok(true)
             }
             _ => Ok(true),
@@ -1380,10 +1687,11 @@ impl DnsPanel {
 
     fn handle_paste(&mut self, text: &str) {
         match &mut self.mode {
-            Mode::Filter(state) => state.value.push_str(text),
-            Mode::CreateZone(form) => form.active_value_mut().push_str(text),
-            Mode::Add(form) => form.active_value_mut().push_str(text),
-            Mode::Edit(form) => form.active_value_mut().push_str(text),
+            Mode::Filter(state) => state.insert_str(text),
+            Mode::CreateZone(form) => form.insert_str(text),
+            Mode::Add(form) => form.insert_str(text),
+            Mode::Edit(form) => form.insert_str(text),
+            Mode::SoaEdit(form) => form.insert_str(text),
             Mode::Browse | Mode::Soa(_) | Mode::DeleteConfirm(_) => {}
         }
     }
@@ -1719,6 +2027,69 @@ impl DnsPanel {
         Ok(())
     }
 
+    fn submit_soa_edit_form(&mut self, form: &SoaEditForm) -> AppResult<()> {
+        if self.active_mutation_request.is_some() {
+            self.message = Some(FlashMessage::warning(
+                "wait for the current change to finish",
+            ));
+            return Ok(());
+        }
+
+        let runner = self
+            .runner
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| AppError::Message("pdnsutil is unavailable".to_string()))?;
+        let replace_spec = match build_soa_edit_replace_spec(&form.zone, &form.input) {
+            Ok(spec) => spec,
+            Err(err) => {
+                self.message = Some(FlashMessage::error(err.to_string()));
+                return Ok(());
+            }
+        };
+        let zone = form.zone.clone();
+
+        if self.global.dry_run {
+            let output =
+                run_mutation_with_runner(&runner, &runner.replace_rrset_args(&replace_spec))?;
+            self.message = Some(self.build_mutation_message(
+                format!("dry run: edit SOA {}", zone),
+                output,
+                None,
+            ));
+            return Ok(());
+        }
+
+        let request_id = self.next_request_id();
+        self.active_mutation_request = Some(request_id);
+        self.message = Some(FlashMessage::info("updating SOA..."));
+
+        let background_tx = self.background_tx.clone();
+        thread::spawn(move || {
+            let result = (|| {
+                let output =
+                    run_mutation_with_runner(&runner, &runner.replace_rrset_args(&replace_spec))?;
+                let records = verify_rrset_replaced(&runner, &replace_spec)?;
+                let zone_warning = zone_health_warning(&zone, &records);
+                Ok(MutationResult::EditSoa {
+                    zone: zone.clone(),
+                    records,
+                    output,
+                    serial_warning: None,
+                    zone_warning,
+                })
+            })();
+
+            let _ = background_tx.send(BackgroundEvent::MutationFinished {
+                request_id,
+                zone,
+                result,
+            });
+        });
+
+        Ok(())
+    }
+
     fn submit_create_zone_form(&mut self, form: &CreateZoneForm) -> AppResult<()> {
         if self.active_mutation_request.is_some() {
             self.message = Some(FlashMessage::warning(
@@ -1743,7 +2114,12 @@ impl DnsPanel {
         let zone = spec.zone.clone();
 
         if self.global.dry_run {
-            let output = run_mutation_with_runner(&runner, &runner.create_zone_args(&spec))?;
+            let create_output = run_mutation_with_runner(&runner, &runner.create_zone_args(&spec))?;
+            let soa_input = SoaEditInput::default_for_zone(&spec.zone, &spec.primary_nameserver);
+            let soa_spec = build_soa_edit_replace_spec(&spec.zone, &soa_input)?;
+            let soa_output =
+                run_mutation_with_runner(&runner, &runner.replace_rrset_args(&soa_spec))?;
+            let output = combine_optional_warnings([create_output, soa_output]);
             self.message = Some(self.build_mutation_message(
                 format!("dry run: create zone {}", spec.zone),
                 output,
@@ -1759,10 +2135,64 @@ impl DnsPanel {
         let background_tx = self.background_tx.clone();
         thread::spawn(move || {
             let result = (|| {
-                let output = run_mutation_with_runner(&runner, &runner.create_zone_args(&spec))?;
-                let records = verify_zone_created(&runner, &spec)?;
+                let create_output =
+                    run_mutation_with_runner(&runner, &runner.create_zone_args(&spec))?;
+                let mut records = verify_zone_created(&runner, &spec)?;
+                let mut output_parts = Vec::new();
+                let mut soa_setup_warning = None;
+
+                if let Some(output) = create_output {
+                    if !output.is_empty() {
+                        output_parts.push(output);
+                    }
+                }
+
+                let soa_input =
+                    SoaEditInput::default_for_zone(&spec.zone, &spec.primary_nameserver);
+                match build_soa_edit_replace_spec(&spec.zone, &soa_input) {
+                    Ok(soa_spec) => {
+                        match run_mutation_with_runner(
+                            &runner,
+                            &runner.replace_rrset_args(&soa_spec),
+                        ) {
+                            Ok(soa_output) => match verify_rrset_replaced(&runner, &soa_spec) {
+                                Ok(soa_records) => {
+                                    records = soa_records;
+                                    if let Some(output) = soa_output {
+                                        if !output.is_empty() {
+                                            output_parts.push(output);
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    soa_setup_warning = Some(format!(
+                                        "zone created, but failed to initialize SOA: {err}"
+                                    ));
+                                }
+                            },
+                            Err(err) => {
+                                soa_setup_warning = Some(format!(
+                                    "zone created, but failed to initialize SOA: {err}"
+                                ));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        soa_setup_warning =
+                            Some(format!("zone created, but failed to prepare SOA: {err}"));
+                    }
+                }
+
+                let output = if output_parts.is_empty() {
+                    None
+                } else {
+                    Some(output_parts.join(" | "))
+                };
                 let zones = runner.list_zones()?;
-                let zone_warning = zone_health_warning(&spec.zone, &records);
+                let zone_warning = combine_optional_warnings([
+                    soa_setup_warning,
+                    zone_health_warning(&spec.zone, &records),
+                ]);
                 Ok(MutationResult::CreateZone {
                     zone: spec.zone,
                     zones,
@@ -1985,6 +2415,7 @@ impl CreateZoneForm {
             zone: String::new(),
             nameserver: "ns1".to_string(),
             field: CreateZoneField::Zone,
+            cursor: 0,
         }
     }
 
@@ -1993,16 +2424,59 @@ impl CreateZoneForm {
             CreateZoneField::Zone => CreateZoneField::Nameserver,
             CreateZoneField::Nameserver => CreateZoneField::Zone,
         };
+        self.cursor = value_char_len(self.active_value());
     }
 
     fn previous_field(&mut self) {
         self.next_field();
     }
 
-    fn active_value_mut(&mut self) -> &mut String {
+    fn active_value(&self) -> &str {
         match self.field {
-            CreateZoneField::Zone => &mut self.zone,
-            CreateZoneField::Nameserver => &mut self.nameserver,
+            CreateZoneField::Zone => &self.zone,
+            CreateZoneField::Nameserver => &self.nameserver,
+        }
+    }
+
+    fn move_cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_cursor_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(value_char_len(self.active_value()));
+    }
+
+    fn backspace(&mut self) {
+        match self.field {
+            CreateZoneField::Zone => backspace_at_cursor(&mut self.zone, &mut self.cursor),
+            CreateZoneField::Nameserver => {
+                backspace_at_cursor(&mut self.nameserver, &mut self.cursor)
+            }
+        }
+    }
+
+    fn delete(&mut self) {
+        match self.field {
+            CreateZoneField::Zone => delete_at_cursor(&mut self.zone, self.cursor),
+            CreateZoneField::Nameserver => delete_at_cursor(&mut self.nameserver, self.cursor),
+        }
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        match self.field {
+            CreateZoneField::Zone => insert_char_at_cursor(&mut self.zone, &mut self.cursor, ch),
+            CreateZoneField::Nameserver => {
+                insert_char_at_cursor(&mut self.nameserver, &mut self.cursor, ch)
+            }
+        }
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        match self.field {
+            CreateZoneField::Zone => insert_str_at_cursor(&mut self.zone, &mut self.cursor, text),
+            CreateZoneField::Nameserver => {
+                insert_str_at_cursor(&mut self.nameserver, &mut self.cursor, text)
+            }
         }
     }
 }
@@ -2019,6 +2493,7 @@ impl EditForm {
             content: record.content.clone(),
             ttl: record.ttl.map(|ttl| ttl.to_string()).unwrap_or_default(),
             field: EditField::Content,
+            cursor: value_char_len(&record.content),
         }
     }
 
@@ -2027,16 +2502,212 @@ impl EditForm {
             EditField::Content => EditField::Ttl,
             EditField::Ttl => EditField::Content,
         };
+        self.cursor = value_char_len(self.active_value());
     }
 
     fn previous_field(&mut self) {
         self.next_field();
     }
 
-    fn active_value_mut(&mut self) -> &mut String {
+    fn active_value(&self) -> &str {
         match self.field {
-            EditField::Content => &mut self.content,
-            EditField::Ttl => &mut self.ttl,
+            EditField::Content => &self.content,
+            EditField::Ttl => &self.ttl,
+        }
+    }
+
+    fn move_cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_cursor_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(value_char_len(self.active_value()));
+    }
+
+    fn backspace(&mut self) {
+        match self.field {
+            EditField::Content => backspace_at_cursor(&mut self.content, &mut self.cursor),
+            EditField::Ttl => backspace_at_cursor(&mut self.ttl, &mut self.cursor),
+        }
+    }
+
+    fn delete(&mut self) {
+        match self.field {
+            EditField::Content => delete_at_cursor(&mut self.content, self.cursor),
+            EditField::Ttl => delete_at_cursor(&mut self.ttl, self.cursor),
+        }
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        match self.field {
+            EditField::Content => insert_char_at_cursor(&mut self.content, &mut self.cursor, ch),
+            EditField::Ttl => insert_char_at_cursor(&mut self.ttl, &mut self.cursor, ch),
+        }
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        match self.field {
+            EditField::Content => insert_str_at_cursor(&mut self.content, &mut self.cursor, text),
+            EditField::Ttl => insert_str_at_cursor(&mut self.ttl, &mut self.cursor, text),
+        }
+    }
+}
+
+impl SoaEditForm {
+    fn from_dialog(dialog: &SoaDialog) -> Self {
+        let note = if dialog.inspection.apex_soa.is_empty() {
+            Some("No apex SOA record is present. Saving will write one apex SOA rrset.".to_string())
+        } else if dialog.inspection.apex_soa.len() > 1 {
+            Some(format!(
+                "{} apex SOA records are present. Saving will replace them with one SOA rrset.",
+                dialog.inspection.apex_soa.len()
+            ))
+        } else {
+            dialog.inspection.warning.clone()
+        };
+
+        let input = SoaEditInput::from_apex_soa(&dialog.inspection.apex_soa);
+        let cursor = value_char_len(&input.primary_nameserver);
+
+        Self {
+            zone: dialog.zone.clone(),
+            input,
+            field: SoaEditField::PrimaryNameserver,
+            note,
+            cursor,
+        }
+    }
+
+    fn next_field(&mut self) {
+        self.field = match self.field {
+            SoaEditField::PrimaryNameserver => SoaEditField::Mailbox,
+            SoaEditField::Mailbox => SoaEditField::Serial,
+            SoaEditField::Serial => SoaEditField::Refresh,
+            SoaEditField::Refresh => SoaEditField::Retry,
+            SoaEditField::Retry => SoaEditField::Expire,
+            SoaEditField::Expire => SoaEditField::Minimum,
+            SoaEditField::Minimum => SoaEditField::Ttl,
+            SoaEditField::Ttl => SoaEditField::PrimaryNameserver,
+        };
+        self.cursor = value_char_len(self.active_value());
+    }
+
+    fn previous_field(&mut self) {
+        self.field = match self.field {
+            SoaEditField::PrimaryNameserver => SoaEditField::Ttl,
+            SoaEditField::Mailbox => SoaEditField::PrimaryNameserver,
+            SoaEditField::Serial => SoaEditField::Mailbox,
+            SoaEditField::Refresh => SoaEditField::Serial,
+            SoaEditField::Retry => SoaEditField::Refresh,
+            SoaEditField::Expire => SoaEditField::Retry,
+            SoaEditField::Minimum => SoaEditField::Expire,
+            SoaEditField::Ttl => SoaEditField::Minimum,
+        };
+        self.cursor = value_char_len(self.active_value());
+    }
+
+    fn active_value(&self) -> &str {
+        match self.field {
+            SoaEditField::PrimaryNameserver => &self.input.primary_nameserver,
+            SoaEditField::Mailbox => &self.input.mailbox,
+            SoaEditField::Serial => &self.input.serial,
+            SoaEditField::Refresh => &self.input.refresh,
+            SoaEditField::Retry => &self.input.retry,
+            SoaEditField::Expire => &self.input.expire,
+            SoaEditField::Minimum => &self.input.minimum,
+            SoaEditField::Ttl => &self.input.ttl,
+        }
+    }
+
+    fn move_cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_cursor_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(value_char_len(self.active_value()));
+    }
+
+    fn backspace(&mut self) {
+        match self.field {
+            SoaEditField::PrimaryNameserver => {
+                backspace_at_cursor(&mut self.input.primary_nameserver, &mut self.cursor)
+            }
+            SoaEditField::Mailbox => backspace_at_cursor(&mut self.input.mailbox, &mut self.cursor),
+            SoaEditField::Serial => backspace_at_cursor(&mut self.input.serial, &mut self.cursor),
+            SoaEditField::Refresh => backspace_at_cursor(&mut self.input.refresh, &mut self.cursor),
+            SoaEditField::Retry => backspace_at_cursor(&mut self.input.retry, &mut self.cursor),
+            SoaEditField::Expire => backspace_at_cursor(&mut self.input.expire, &mut self.cursor),
+            SoaEditField::Minimum => backspace_at_cursor(&mut self.input.minimum, &mut self.cursor),
+            SoaEditField::Ttl => backspace_at_cursor(&mut self.input.ttl, &mut self.cursor),
+        }
+    }
+
+    fn delete(&mut self) {
+        match self.field {
+            SoaEditField::PrimaryNameserver => {
+                delete_at_cursor(&mut self.input.primary_nameserver, self.cursor)
+            }
+            SoaEditField::Mailbox => delete_at_cursor(&mut self.input.mailbox, self.cursor),
+            SoaEditField::Serial => delete_at_cursor(&mut self.input.serial, self.cursor),
+            SoaEditField::Refresh => delete_at_cursor(&mut self.input.refresh, self.cursor),
+            SoaEditField::Retry => delete_at_cursor(&mut self.input.retry, self.cursor),
+            SoaEditField::Expire => delete_at_cursor(&mut self.input.expire, self.cursor),
+            SoaEditField::Minimum => delete_at_cursor(&mut self.input.minimum, self.cursor),
+            SoaEditField::Ttl => delete_at_cursor(&mut self.input.ttl, self.cursor),
+        }
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        match self.field {
+            SoaEditField::PrimaryNameserver => {
+                insert_char_at_cursor(&mut self.input.primary_nameserver, &mut self.cursor, ch)
+            }
+            SoaEditField::Mailbox => {
+                insert_char_at_cursor(&mut self.input.mailbox, &mut self.cursor, ch)
+            }
+            SoaEditField::Serial => {
+                insert_char_at_cursor(&mut self.input.serial, &mut self.cursor, ch)
+            }
+            SoaEditField::Refresh => {
+                insert_char_at_cursor(&mut self.input.refresh, &mut self.cursor, ch)
+            }
+            SoaEditField::Retry => {
+                insert_char_at_cursor(&mut self.input.retry, &mut self.cursor, ch)
+            }
+            SoaEditField::Expire => {
+                insert_char_at_cursor(&mut self.input.expire, &mut self.cursor, ch)
+            }
+            SoaEditField::Minimum => {
+                insert_char_at_cursor(&mut self.input.minimum, &mut self.cursor, ch)
+            }
+            SoaEditField::Ttl => insert_char_at_cursor(&mut self.input.ttl, &mut self.cursor, ch),
+        }
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        match self.field {
+            SoaEditField::PrimaryNameserver => {
+                insert_str_at_cursor(&mut self.input.primary_nameserver, &mut self.cursor, text)
+            }
+            SoaEditField::Mailbox => {
+                insert_str_at_cursor(&mut self.input.mailbox, &mut self.cursor, text)
+            }
+            SoaEditField::Serial => {
+                insert_str_at_cursor(&mut self.input.serial, &mut self.cursor, text)
+            }
+            SoaEditField::Refresh => {
+                insert_str_at_cursor(&mut self.input.refresh, &mut self.cursor, text)
+            }
+            SoaEditField::Retry => {
+                insert_str_at_cursor(&mut self.input.retry, &mut self.cursor, text)
+            }
+            SoaEditField::Expire => {
+                insert_str_at_cursor(&mut self.input.expire, &mut self.cursor, text)
+            }
+            SoaEditField::Minimum => {
+                insert_str_at_cursor(&mut self.input.minimum, &mut self.cursor, text)
+            }
+            SoaEditField::Ttl => insert_str_at_cursor(&mut self.input.ttl, &mut self.cursor, text),
         }
     }
 }
@@ -2049,6 +2720,7 @@ impl AddForm {
             content: String::new(),
             ttl: String::new(),
             field: AddField::Type,
+            cursor: 1,
         }
     }
 
@@ -2059,6 +2731,7 @@ impl AddForm {
             AddField::Content => AddField::Ttl,
             AddField::Ttl => AddField::Type,
         };
+        self.cursor = value_char_len(self.active_value());
     }
 
     fn previous_field(&mut self) {
@@ -2068,46 +2741,226 @@ impl AddForm {
             AddField::Content => AddField::Name,
             AddField::Ttl => AddField::Content,
         };
+        self.cursor = value_char_len(self.active_value());
     }
 
-    fn active_value_mut(&mut self) -> &mut String {
+    fn active_value(&self) -> &str {
         match self.field {
-            AddField::Type => &mut self.record_type,
-            AddField::Name => &mut self.name,
-            AddField::Content => &mut self.content,
-            AddField::Ttl => &mut self.ttl,
+            AddField::Type => &self.record_type,
+            AddField::Name => &self.name,
+            AddField::Content => &self.content,
+            AddField::Ttl => &self.ttl,
+        }
+    }
+
+    fn move_cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_cursor_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(value_char_len(self.active_value()));
+    }
+
+    fn backspace(&mut self) {
+        match self.field {
+            AddField::Type => backspace_at_cursor(&mut self.record_type, &mut self.cursor),
+            AddField::Name => backspace_at_cursor(&mut self.name, &mut self.cursor),
+            AddField::Content => backspace_at_cursor(&mut self.content, &mut self.cursor),
+            AddField::Ttl => backspace_at_cursor(&mut self.ttl, &mut self.cursor),
+        }
+    }
+
+    fn delete(&mut self) {
+        match self.field {
+            AddField::Type => delete_at_cursor(&mut self.record_type, self.cursor),
+            AddField::Name => delete_at_cursor(&mut self.name, self.cursor),
+            AddField::Content => delete_at_cursor(&mut self.content, self.cursor),
+            AddField::Ttl => delete_at_cursor(&mut self.ttl, self.cursor),
+        }
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        match self.field {
+            AddField::Type => insert_char_at_cursor(&mut self.record_type, &mut self.cursor, ch),
+            AddField::Name => insert_char_at_cursor(&mut self.name, &mut self.cursor, ch),
+            AddField::Content => insert_char_at_cursor(&mut self.content, &mut self.cursor, ch),
+            AddField::Ttl => insert_char_at_cursor(&mut self.ttl, &mut self.cursor, ch),
+        }
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        match self.field {
+            AddField::Type => insert_str_at_cursor(&mut self.record_type, &mut self.cursor, text),
+            AddField::Name => insert_str_at_cursor(&mut self.name, &mut self.cursor, text),
+            AddField::Content => insert_str_at_cursor(&mut self.content, &mut self.cursor, text),
+            AddField::Ttl => insert_str_at_cursor(&mut self.ttl, &mut self.cursor, text),
         }
     }
 }
 
 impl FlashMessage {
-    fn info(text: impl Into<String>) -> Self {
+    fn new(kind: FlashKind, text: impl Into<String>) -> Self {
+        let kind_copy = kind;
         Self {
-            kind: FlashKind::Info,
+            kind,
             text: text.into(),
+            expires_at: Instant::now() + flash_duration(kind_copy),
         }
+    }
+
+    fn info(text: impl Into<String>) -> Self {
+        Self::new(FlashKind::Info, text)
     }
 
     fn success(text: impl Into<String>) -> Self {
-        Self {
-            kind: FlashKind::Success,
-            text: text.into(),
-        }
+        Self::new(FlashKind::Success, text)
     }
 
     fn warning(text: impl Into<String>) -> Self {
-        Self {
-            kind: FlashKind::Warning,
-            text: text.into(),
-        }
+        Self::new(FlashKind::Warning, text)
     }
 
     fn error(text: impl Into<String>) -> Self {
-        Self {
-            kind: FlashKind::Error,
-            text: text.into(),
+        Self::new(FlashKind::Error, text)
+    }
+}
+
+impl FilterState {
+    fn move_cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_cursor_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(value_char_len(&self.value));
+    }
+
+    fn backspace(&mut self) {
+        backspace_at_cursor(&mut self.value, &mut self.cursor);
+    }
+
+    fn delete(&mut self) {
+        delete_at_cursor(&mut self.value, self.cursor);
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        insert_char_at_cursor(&mut self.value, &mut self.cursor, ch);
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        insert_str_at_cursor(&mut self.value, &mut self.cursor, text);
+    }
+}
+
+fn flash_duration(kind: FlashKind) -> Duration {
+    match kind {
+        FlashKind::Info => Duration::from_secs(3),
+        FlashKind::Success => Duration::from_secs(4),
+        FlashKind::Warning => Duration::from_secs(6),
+        FlashKind::Error => Duration::from_secs(8),
+    }
+}
+
+fn input_line(
+    label: String,
+    label_style: Style,
+    value: &str,
+    cursor: Option<usize>,
+) -> Line<'static> {
+    let mut spans = vec![Span::styled(label, label_style)];
+
+    match cursor {
+        None => spans.push(Span::styled(
+            if value.is_empty() {
+                " ".to_string()
+            } else {
+                value.to_string()
+            },
+            Style::default().fg(Color::White),
+        )),
+        Some(cursor) => {
+            let cursor = clamp_cursor(cursor, value);
+            let cursor_byte = char_to_byte_index(value, cursor);
+            let value_style = Style::default().fg(Color::White);
+            let cursor_style = Style::default()
+                .fg(Color::Black)
+                .bg(BRAND)
+                .add_modifier(Modifier::BOLD);
+
+            if cursor_byte > 0 {
+                spans.push(Span::styled(value[..cursor_byte].to_string(), value_style));
+            }
+
+            if cursor < value_char_len(value) {
+                let next_byte = char_to_byte_index(value, cursor + 1);
+                spans.push(Span::styled(
+                    value[cursor_byte..next_byte].to_string(),
+                    cursor_style,
+                ));
+                if next_byte < value.len() {
+                    spans.push(Span::styled(value[next_byte..].to_string(), value_style));
+                }
+            } else {
+                spans.push(Span::styled("█", Style::default().fg(BRAND)));
+            }
         }
     }
+
+    Line::from(spans)
+}
+
+fn value_char_len(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn clamp_cursor(cursor: usize, value: &str) -> usize {
+    cursor.min(value_char_len(value))
+}
+
+fn char_to_byte_index(value: &str, char_index: usize) -> usize {
+    if char_index == 0 {
+        return 0;
+    }
+
+    value
+        .char_indices()
+        .nth(char_index)
+        .map(|(byte_index, _)| byte_index)
+        .unwrap_or_else(|| value.len())
+}
+
+fn insert_char_at_cursor(value: &mut String, cursor: &mut usize, ch: char) {
+    let insert_at = char_to_byte_index(value, clamp_cursor(*cursor, value));
+    value.insert(insert_at, ch);
+    *cursor += 1;
+}
+
+fn insert_str_at_cursor(value: &mut String, cursor: &mut usize, text: &str) {
+    let insert_at = char_to_byte_index(value, clamp_cursor(*cursor, value));
+    value.insert_str(insert_at, text);
+    *cursor += text.chars().count();
+}
+
+fn backspace_at_cursor(value: &mut String, cursor: &mut usize) {
+    let cursor_pos = clamp_cursor(*cursor, value);
+    if cursor_pos == 0 {
+        return;
+    }
+
+    let remove_start = char_to_byte_index(value, cursor_pos - 1);
+    let remove_end = char_to_byte_index(value, cursor_pos);
+    value.replace_range(remove_start..remove_end, "");
+    *cursor -= 1;
+}
+
+fn delete_at_cursor(value: &mut String, cursor: usize) {
+    let cursor_pos = clamp_cursor(cursor, value);
+    if cursor_pos >= value_char_len(value) {
+        return;
+    }
+
+    let remove_start = char_to_byte_index(value, cursor_pos);
+    let remove_end = char_to_byte_index(value, cursor_pos + 1);
+    value.replace_range(remove_start..remove_end, "");
 }
 
 fn normalize_add_content(record_type: &str, content: &str, zone: &str) -> AppResult<String> {
@@ -2150,4 +3003,69 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dry_run_panel(syntax: PdnsSyntax) -> DnsPanel {
+        let global = GlobalOptions {
+            dry_run: true,
+            ..GlobalOptions::default()
+        };
+        let runner = PdnsUtil {
+            global: global.clone(),
+            syntax,
+        };
+        let mut panel = DnsPanel::new(global);
+        panel.runner = Some(runner);
+        panel
+    }
+
+    fn soa_edit_form(ttl: &str) -> SoaEditForm {
+        SoaEditForm {
+            zone: "example.com.".to_string(),
+            input: SoaEditInput {
+                primary_nameserver: "ns1.example.com.".to_string(),
+                mailbox: "hostmaster.example.com.".to_string(),
+                serial: "2026041401".to_string(),
+                refresh: "3600".to_string(),
+                retry: "600".to_string(),
+                expire: "1209600".to_string(),
+                minimum: "300".to_string(),
+                ttl: ttl.to_string(),
+            },
+            field: SoaEditField::PrimaryNameserver,
+            note: None,
+            cursor: 0,
+        }
+    }
+
+    #[test]
+    fn dry_run_soa_edit_does_not_plan_serial_bump() {
+        let mut panel = dry_run_panel(PdnsSyntax::Legacy);
+
+        panel
+            .submit_soa_edit_form(&soa_edit_form("300"))
+            .expect("SOA edit should succeed");
+
+        let message = panel.message.expect("expected flash message");
+        assert!(message.text.contains("dry run: edit SOA example.com."));
+        assert!(message.text.contains("replace-rrset"));
+        assert!(!message.text.contains("SOA serial bump planned"));
+    }
+
+    #[test]
+    fn soa_edit_validation_errors_stay_in_tui() {
+        let mut panel = dry_run_panel(PdnsSyntax::Legacy);
+
+        panel
+            .submit_soa_edit_form(&soa_edit_form(""))
+            .expect("validation errors should not exit the TUI");
+
+        let message = panel.message.expect("expected flash message");
+        assert_eq!(message.text, "SOA TTL is required");
+        assert!(matches!(message.kind, FlashKind::Error));
+    }
 }
