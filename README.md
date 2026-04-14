@@ -15,7 +15,7 @@ The main goal is to lower the learning cost of `pdnsutil` by giving you an inter
 ## Acknowledgements
 
 - Thanks to [PowerDNS](https://www.powerdns.com/) for the software that `ppdns` builds on top of.
-- Thanks to [LINUX DO](https://linux.do/) for the promotion opportunity and community exposure.
+- Thanks to [LINUX DO](https://linux.do/t/topic/1965543) for the promotion opportunity and community exposure.
 
 ## Features
 
