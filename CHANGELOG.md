@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0] - 2026-04-14
+
+### Added
+
+- Added TUI zone creation on `z`, record editing on `e`, and a dedicated SOA health and edit flow on `s`, with verified post-mutation reloads after each change.
+- Added a local Docker-based PowerDNS `4.8.x` sandbox and a contributor guide so legacy compatibility can be tested before release.
+
+### Changed
+
+- Kept the product TUI-first, simplified the panel presentation, and reduced persistent status noise so it stays usable on smaller machines.
+- Defaulted startup focus to the records pane and expanded CI to publish branch build artifacts for feature-branch testing.
+
+### Fixed
+
+- Verified create, add, edit, delete, and SOA repair results against reloaded zone state instead of trusting `pdnsutil` success output alone.
+- Restored legacy PowerDNS `4.8.x` compatibility for owner-name handling and safer delete and replace flows, especially for multi-value RRsets.
+- Fixed TUI responsiveness, input cursor editing, and SOA edit handling so explicit serial and TTL values are respected.
+
 ## [1.1.0-alpha.7] - 2026-04-13
 
 ### Added
